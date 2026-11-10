@@ -15,77 +15,137 @@
 package fileserver
 
 import (
+	"context"
+	"io/fs"
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dustin/go-humanize"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/dustin/go-humanize"
 )
 
-func (fsrv *FileServer) directoryListing(files []os.FileInfo, canGoUp bool, root, urlPath string, repl *caddy.Replacer) browseTemplateContext {
+func (fsrv *FileServer) directoryListing(ctx context.Context, fileSystem fs.FS, parentModTime time.Time, entries []fs.DirEntry, canGoUp bool, dirPath, urlPath string, repl *caddy.Replacer) *browseTemplateContext {
 	filesToHide := fsrv.transformHidePaths(repl)
 
-	var dirCount, fileCount int
-	fileInfos := []fileInfo{}
+	// urlPath is escaped, but filesystem lookups need the decoded path
+	reqPath, _ := url.PathUnescape(urlPath)
 
-	for _, f := range files {
-		name := f.Name()
+	tplCtx := &browseTemplateContext{
+		Name:         path.Base(reqPath),
+		Path:         urlPath,
+		CanGoUp:      canGoUp,
+		lastModified: parentModTime,
+		// preallocate, since we know the upper bound on the number of
+		// items; avoids repeated slice growth/copy for large directories
+		Items: make([]fileInfo, 0, len(entries)),
+	}
 
-		if fileHidden(name, filesToHide) {
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+
+		name := entry.Name()
+
+		if fileHidden(caddyhttp.SanitizedPathJoin(dirPath, name), filesToHide) {
 			continue
 		}
 
-		isDir := f.IsDir() || isSymlinkTargetDir(f, root, urlPath)
+		info, err := entry.Info()
+		if err != nil {
+			if c := fsrv.logger.Check(zapcore.ErrorLevel, "could not get info about directory entry"); c != nil {
+				c.Write(zap.String("name", entry.Name()), zap.String("dir_path", dirPath))
+			}
+			continue
+		}
+
+		// keep track of the most recently modified item in the listing
+		modTime := info.ModTime()
+		if tplCtx.lastModified.IsZero() || modTime.After(tplCtx.lastModified) {
+			tplCtx.lastModified = modTime
+		}
+
+		fileIsSymlink := isSymlink(info)
+		size := info.Size()
+
+		// for a symlink, a single stat of its target tells us both whether
+		// the target is a directory and what its size is
+		var targetInfo fs.FileInfo
+		var targetPath string
+		if fileIsSymlink {
+			targetPath = caddyhttp.SanitizedPathJoin(dirPath, info.Name())
+			// An error most likely means the symlink target doesn't exist,
+			// which isn't entirely unusual and shouldn't fail the listing.
+			// In this case, targetInfo stays nil and we fall back to
+			// treating it as a non-directory, using the symlink's own size.
+			targetInfo, _ = fs.Stat(fileSystem, targetPath)
+		}
+
+		isDir := entry.IsDir() || (targetInfo != nil && targetInfo.IsDir())
 
 		// add the slash after the escape of path to avoid escaping the slash as well
 		if isDir {
 			name += "/"
-			dirCount++
+			tplCtx.NumDirs++
 		} else {
-			fileCount++
+			tplCtx.NumFiles++
 		}
 
-		size := f.Size()
-		fileIsSymlink := isSymlink(f)
+		if !isDir {
+			// increase the total by the symlink's size, not the target's size,
+			// by incrementing before we follow the symlink
+			tplCtx.TotalFileSize += size
+		}
+
+		symlinkPath := ""
 		if fileIsSymlink {
-			path := caddyhttp.SanitizedPathJoin(root, path.Join(urlPath, f.Name()))
-			fileInfo, err := os.Stat(path)
-			if err == nil {
-				size = fileInfo.Size()
+			if targetInfo != nil {
+				size = targetInfo.Size()
 			}
-			// An error most likely means the symlink target doesn't exist,
-			// which isn't entirely unusual and shouldn't fail the listing.
-			// In this case, just use the size of the symlink itself, which
-			// was already set above.
+
+			if fsrv.Browse.RevealSymlinks {
+				symLinkTarget, err := os.Readlink(targetPath)
+				if err == nil {
+					symlinkPath = symLinkTarget
+				}
+			}
+		}
+
+		if !isDir {
+			// increase the total including the symlink target's size
+			tplCtx.TotalFileSizeFollowingSymlinks += size
 		}
 
 		u := url.URL{Path: "./" + name} // prepend with "./" to fix paths with ':' in the name
 
-		fileInfos = append(fileInfos, fileInfo{
-			IsDir:     isDir,
-			IsSymlink: fileIsSymlink,
-			Name:      name,
-			Size:      size,
-			URL:       u.String(),
-			ModTime:   f.ModTime().UTC(),
-			Mode:      f.Mode(),
+		tplCtx.Items = append(tplCtx.Items, fileInfo{
+			IsDir:       isDir,
+			IsSymlink:   fileIsSymlink,
+			Name:        name,
+			Size:        size,
+			URL:         u.String(),
+			ModTime:     modTime.UTC(),
+			Mode:        info.Mode(),
+			Tpl:         tplCtx, // a reference up to the template context is useful
+			SymlinkPath: symlinkPath,
 		})
 	}
-	name, _ := url.PathUnescape(urlPath)
-	return browseTemplateContext{
-		Name:     path.Base(name),
-		Path:     urlPath,
-		CanGoUp:  canGoUp,
-		Items:    fileInfos,
-		NumDirs:  dirCount,
-		NumFiles: fileCount,
-	}
+
+	// this time is used for the Last-Modified header and comparing If-Modified-Since from client
+	// both are expected to be in UTC, so we convert to UTC here
+	// see: https://github.com/caddyserver/caddy/issues/6828
+	tplCtx.lastModified = tplCtx.lastModified.UTC()
+	return tplCtx
 }
 
 // browseTemplateContext provides the template context for directory listings.
@@ -96,7 +156,7 @@ type browseTemplateContext struct {
 	// The full path of the request.
 	Path string `json:"path"`
 
-	// Whether the parent directory is browseable.
+	// Whether the parent directory is browsable.
 	CanGoUp bool `json:"can_go_up"`
 
 	// The items (files and folders) in the path.
@@ -114,11 +174,27 @@ type browseTemplateContext struct {
 	// The number of files (items that aren't directories) in the listing.
 	NumFiles int `json:"num_files"`
 
+	// The total size of all files in the listing. Only includes the
+	// size of the files themselves, not the size of symlink targets
+	// (i.e. the calculation of this value does not follow symlinks).
+	TotalFileSize int64 `json:"total_file_size"`
+
+	// The total size of all files in the listing, including the
+	// size of the files targeted by symlinks.
+	TotalFileSizeFollowingSymlinks int64 `json:"total_file_size_following_symlinks"`
+
 	// Sort column used
 	Sort string `json:"sort,omitempty"`
 
 	// Sorting order
 	Order string `json:"order,omitempty"`
+
+	// Display format (list or grid)
+	Layout string `json:"layout,omitempty"`
+
+	// The most recent file modification date in the listing.
+	// Used for HTTP header purposes.
+	lastModified time.Time
 }
 
 // Breadcrumbs returns l.Path where every element maps
@@ -154,6 +230,14 @@ func (l *browseTemplateContext) applySortAndLimit(sortParam, orderParam, limitPa
 	l.Sort = sortParam
 	l.Order = orderParam
 
+	// Only compute lowercase names when the selected sort comparator needs it;
+	// avoid O(n) work when sorting by time or when no sorting is requested.
+	if l.Sort == sortByName || l.Sort == sortByNameDirFirst || l.Sort == sortBySize {
+		for i := range l.Items {
+			l.Items[i].nameLower = strings.ToLower(l.Items[i].Name)
+		}
+	}
+
 	if l.Order == "desc" {
 		switch l.Sort {
 		case sortByName:
@@ -180,8 +264,8 @@ func (l *browseTemplateContext) applySortAndLimit(sortParam, orderParam, limitPa
 
 	if offsetParam != "" {
 		offset, _ := strconv.Atoi(offsetParam)
-		if offset > 0 && offset <= len(l.Items) {
-			l.Items = l.Items[offset:]
+		if offset > 0 {
+			l.Items = l.Items[min(offset, len(l.Items)):]
 			l.Offset = offset
 		}
 	}
@@ -205,13 +289,29 @@ type crumb struct {
 // fileInfo contains serializable information
 // about a file or directory.
 type fileInfo struct {
-	Name      string      `json:"name"`
-	Size      int64       `json:"size"`
-	URL       string      `json:"url"`
-	ModTime   time.Time   `json:"mod_time"`
-	Mode      os.FileMode `json:"mode"`
-	IsDir     bool        `json:"is_dir"`
-	IsSymlink bool        `json:"is_symlink"`
+	Name        string      `json:"name"`
+	Size        int64       `json:"size"`
+	URL         string      `json:"url"`
+	ModTime     time.Time   `json:"mod_time"`
+	Mode        os.FileMode `json:"mode"`
+	IsDir       bool        `json:"is_dir"`
+	IsSymlink   bool        `json:"is_symlink"`
+	SymlinkPath string      `json:"symlink_path,omitempty"`
+
+	// a pointer to the template context is useful inside nested templates
+	Tpl *browseTemplateContext `json:"-"`
+
+	// cached lowercase Name, precomputed once by applySortAndLimit so that
+	// byName/byNameDirFirst/bySize don't each recompute it on every one of
+	// the O(n log n) comparisons sort.Sort makes; not serialized.
+	nameLower string
+}
+
+// HasExt returns true if the filename has any of the given suffixes, case-insensitive.
+func (fi fileInfo) HasExt(exts ...string) bool {
+	return slices.ContainsFunc(exts, func(ext string) bool {
+		return strings.HasSuffix(strings.ToLower(fi.Name), strings.ToLower(ext))
+	})
 }
 
 // HumanSize returns the size of the file as a
@@ -219,6 +319,19 @@ type fileInfo struct {
 // power of 2 or base 1024).
 func (fi fileInfo) HumanSize() string {
 	return humanize.IBytes(uint64(fi.Size))
+}
+
+// HumanTotalFileSize returns the total size of all files
+// in the listing as a human-readable string in IEC format
+// (i.e. power of 2 or base 1024).
+func (btc browseTemplateContext) HumanTotalFileSize() string {
+	return humanize.IBytes(uint64(btc.TotalFileSize))
+}
+
+// HumanTotalFileSizeFollowingSymlinks is the same as HumanTotalFileSize
+// except the returned value reflects the size of symlink targets.
+func (btc browseTemplateContext) HumanTotalFileSizeFollowingSymlinks() string {
+	return humanize.IBytes(uint64(btc.TotalFileSizeFollowingSymlinks))
 }
 
 // HumanModTime returns the modified time of the file
@@ -238,7 +351,7 @@ func (l byName) Len() int      { return len(l.Items) }
 func (l byName) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.Items[i] }
 
 func (l byName) Less(i, j int) bool {
-	return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
+	return l.Items[i].nameLower < l.Items[j].nameLower
 }
 
 func (l byNameDirFirst) Len() int      { return len(l.Items) }
@@ -247,7 +360,7 @@ func (l byNameDirFirst) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.
 func (l byNameDirFirst) Less(i, j int) bool {
 	// sort by name if both are dir or file
 	if l.Items[i].IsDir == l.Items[j].IsDir {
-		return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
+		return l.Items[i].nameLower < l.Items[j].nameLower
 	}
 	// sort dir ahead of file
 	return l.Items[i].IsDir
@@ -257,7 +370,7 @@ func (l bySize) Len() int      { return len(l.Items) }
 func (l bySize) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.Items[i] }
 
 func (l bySize) Less(i, j int) bool {
-	const directoryOffset = -1 << 31 // = -math.MinInt32
+	const directoryOffset = -1 << 31 // = -2147483648 (min int32)
 
 	iSize, jSize := l.Items[i].Size, l.Items[j].Size
 
@@ -271,7 +384,7 @@ func (l bySize) Less(i, j int) bool {
 		jSize = directoryOffset
 	}
 	if l.Items[i].IsDir && l.Items[j].IsDir {
-		return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
+		return l.Items[i].nameLower < l.Items[j].nameLower
 	}
 
 	return iSize < jSize
@@ -286,4 +399,7 @@ const (
 	sortByNameDirFirst = "namedirfirst"
 	sortBySize         = "size"
 	sortByTime         = "time"
+
+	sortOrderAsc  = "asc"
+	sortOrderDesc = "desc"
 )

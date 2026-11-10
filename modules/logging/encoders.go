@@ -17,11 +17,12 @@ package logging
 import (
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.uber.org/zap"
 	"go.uber.org/zap/buffer"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -45,27 +46,32 @@ func (ConsoleEncoder) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the encoder.
 func (ce *ConsoleEncoder) Provision(_ caddy.Context) error {
+	if ce.LevelFormat == "" {
+		ce.LevelFormat = "color"
+	}
+	if ce.TimeFormat == "" {
+		ce.TimeFormat = "wall_milli"
+	}
 	ce.Encoder = zapcore.NewConsoleEncoder(ce.ZapcoreEncoderConfig())
 	return nil
 }
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
 //
-//     console {
-//         <common encoder config subdirectives...>
-//     }
+//	console {
+//	    <common encoder config subdirectives...>
+//	}
 //
 // See the godoc on the LogEncoderConfig type for the syntax of
 // subdirectives that are common to most/all encoders.
 func (ce *ConsoleEncoder) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
-		err := ce.LogEncoderConfig.UnmarshalCaddyfile(d)
-		if err != nil {
-			return err
-		}
+	d.Next() // consume encoder name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	err := ce.LogEncoderConfig.UnmarshalCaddyfile(d)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -92,56 +98,74 @@ func (je *JSONEncoder) Provision(_ caddy.Context) error {
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
 //
-//     json {
-//         <common encoder config subdirectives...>
-//     }
+//	json {
+//	    <common encoder config subdirectives...>
+//	}
 //
 // See the godoc on the LogEncoderConfig type for the syntax of
 // subdirectives that are common to most/all encoders.
 func (je *JSONEncoder) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if d.NextArg() {
-			return d.ArgErr()
-		}
-		err := je.LogEncoderConfig.UnmarshalCaddyfile(d)
-		if err != nil {
-			return err
-		}
+	d.Next() // consume encoder name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	err := je.LogEncoderConfig.UnmarshalCaddyfile(d)
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
 // LogEncoderConfig holds configuration common to most encoders.
 type LogEncoderConfig struct {
-	MessageKey     *string `json:"message_key,omitempty"`
-	LevelKey       *string `json:"level_key,omitempty"`
-	TimeKey        *string `json:"time_key,omitempty"`
-	NameKey        *string `json:"name_key,omitempty"`
-	CallerKey      *string `json:"caller_key,omitempty"`
-	StacktraceKey  *string `json:"stacktrace_key,omitempty"`
-	LineEnding     *string `json:"line_ending,omitempty"`
-	TimeFormat     string  `json:"time_format,omitempty"`
-	DurationFormat string  `json:"duration_format,omitempty"`
-	LevelFormat    string  `json:"level_format,omitempty"`
+	MessageKey    *string `json:"message_key,omitempty"`
+	LevelKey      *string `json:"level_key,omitempty"`
+	TimeKey       *string `json:"time_key,omitempty"`
+	NameKey       *string `json:"name_key,omitempty"`
+	CallerKey     *string `json:"caller_key,omitempty"`
+	StacktraceKey *string `json:"stacktrace_key,omitempty"`
+	LineEnding    *string `json:"line_ending,omitempty"`
+
+	// Recognized values are: unix_seconds_float, unix_milli_float, unix_nano, iso8601, rfc3339, rfc3339_nano, wall, wall_milli, wall_nano, common_log.
+	// The value may also be custom format per the Go `time` package layout specification, as described [here](https://pkg.go.dev/time#pkg-constants).
+	TimeFormat string `json:"time_format,omitempty"`
+	TimeLocal  bool   `json:"time_local,omitempty"`
+
+	// Recognized values are: s/second/seconds, ns/nano/nanos, ms/milli/millis, string.
+	// Empty and unrecognized value default to seconds.
+	DurationFormat string `json:"duration_format,omitempty"`
+
+	// Recognized values are: lower, upper, color.
+	// Empty and unrecognized value default to lower.
+	LevelFormat string `json:"level_format,omitempty"`
 }
 
 // UnmarshalCaddyfile populates the struct from Caddyfile tokens. Syntax:
 //
-//     {
-//         message_key <key>
-//         level_key   <key>
-//         time_key    <key>
-//         name_key    <key>
-//         caller_key  <key>
-//         stacktrace_key <key>
-//         line_ending  <char>
-//         time_format  <format>
-//         level_format <format>
-//     }
-//
+//	{
+//	    message_key     <key>
+//	    level_key       <key>
+//	    time_key        <key>
+//	    name_key        <key>
+//	    caller_key      <key>
+//	    stacktrace_key  <key>
+//	    line_ending     <char>
+//	    time_format     <format>
+//	    time_local
+//	    duration_format <format>
+//	    level_format    <format>
+//	}
 func (lec *LogEncoderConfig) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for nesting := d.Nesting(); d.NextBlock(nesting); {
+	for d.NextBlock(0) {
 		subdir := d.Val()
+		switch subdir {
+		case "time_local":
+			lec.TimeLocal = true
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			continue
+		}
 		var arg string
 		if !d.AllArgs(&arg) {
 			return d.ArgErr()
@@ -163,6 +187,8 @@ func (lec *LogEncoderConfig) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			lec.LineEnding = &arg
 		case "time_format":
 			lec.TimeFormat = arg
+		case "duration_format":
+			lec.DurationFormat = arg
 		case "level_format":
 			lec.LevelFormat = arg
 		default:
@@ -229,7 +255,13 @@ func (lec *LogEncoderConfig) ZapcoreEncoderConfig() zapcore.EncoderConfig {
 			timeFormat = "02/Jan/2006:15:04:05 -0700"
 		}
 		timeFormatter = func(ts time.Time, encoder zapcore.PrimitiveArrayEncoder) {
-			encoder.AppendString(ts.UTC().Format(timeFormat))
+			var time time.Time
+			if lec.TimeLocal {
+				time = ts.Local()
+			} else {
+				time = ts.UTC()
+			}
+			encoder.AppendString(time.Format(timeFormat))
 		}
 	}
 	cfg.EncodeTime = timeFormatter
@@ -237,12 +269,16 @@ func (lec *LogEncoderConfig) ZapcoreEncoderConfig() zapcore.EncoderConfig {
 	// duration format
 	var durFormatter zapcore.DurationEncoder
 	switch lec.DurationFormat {
-	case "", "seconds":
+	case "s", "second", "seconds":
 		durFormatter = zapcore.SecondsDurationEncoder
-	case "nano":
+	case "ns", "nano", "nanos":
 		durFormatter = zapcore.NanosDurationEncoder
+	case "ms", "milli", "millis":
+		durFormatter = zapcore.MillisDurationEncoder
 	case "string":
 		durFormatter = zapcore.StringDurationEncoder
+	default:
+		durFormatter = zapcore.SecondsDurationEncoder
 	}
 	cfg.EncodeDuration = durFormatter
 

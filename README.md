@@ -1,28 +1,63 @@
 <p align="center">
-	<a href="https://caddyserver.com"><img src="https://user-images.githubusercontent.com/1128849/36338535-05fb646a-136f-11e8-987b-e6901e717d5a.png" alt="Caddy" width="450"></a>
+	<a href="https://caddyserver.com">
+		<picture>
+			<source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/1d6be89c-df8a-438c-b01d-cef6bf56440a">
+			<source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/3a5b7419-6925-48f6-ae75-d231f4a4f0c2">
+			<img src="https://github.com/user-attachments/assets/3a5b7419-6925-48f6-ae75-d231f4a4f0c2" alt="Caddy" width="550">
+		</picture>
+	</a>
 	<br>
-	<h3 align="center">a <a href="https://zerossl.com"><img src="https://caddyserver.com/resources/images/zerossl-logo.svg" height="28" valign="middle"></a> project</h3>
+	<h3 align="center">a <a href="https://zerossl.com"><img src="https://user-images.githubusercontent.com/55066419/208327323-2770dc16-ec09-43a0-9035-c5b872c2ad7f.svg" height="28" style="vertical-align: -7.7px" valign="middle"></a> project</h3>
 </p>
 <hr>
 <h3 align="center">Every site on HTTPS</h3>
 <p align="center">Caddy is an extensible server platform that uses TLS by default.</p>
 <p align="center">
-	<a href="https://github.com/caddyserver/caddy/actions?query=workflow%3ACross-Platform"><img src="https://github.com/caddyserver/caddy/workflows/Cross-Platform/badge.svg"></a>
-	<a href="https://pkg.go.dev/github.com/caddyserver/caddy/v2"><img src="https://img.shields.io/badge/godoc-reference-%23007d9c.svg"></a>
-	<br>
-	<a href="https://twitter.com/caddyserver" title="@caddyserver on Twitter"><img src="https://img.shields.io/badge/twitter-@caddyserver-55acee.svg" alt="@caddyserver on Twitter"></a>
-	<a href="https://caddy.community" title="Caddy Forum"><img src="https://img.shields.io/badge/community-forum-ff69b4.svg" alt="Caddy Forum"></a>
-	<br>
-	<a href="https://sourcegraph.com/github.com/caddyserver/caddy?badge" title="Caddy on Sourcegraph"><img src="https://sourcegraph.com/github.com/caddyserver/caddy/-/badge.svg" alt="Caddy on Sourcegraph"></a>
-	<a href="https://cloudsmith.io/~caddy/repos/"><img src="https://img.shields.io/badge/OSS%20hosting%20by-cloudsmith-blue?logo=cloudsmith" alt="Cloudsmith"></a>
-</p>
-<p align="center">
 	<a href="https://github.com/caddyserver/caddy/releases">Releases</a> ·
 	<a href="https://caddyserver.com/docs/">Documentation</a> ·
 	<a href="https://caddy.community">Get Help</a>
 </p>
+<p align="center">
+	<a href="https://github.com/caddyserver/caddy/actions/workflows/ci.yml"><img src="https://github.com/caddyserver/caddy/actions/workflows/ci.yml/badge.svg"></a>
+	&nbsp;
+	<a href="https://www.bestpractices.dev/projects/7141"><img src="https://www.bestpractices.dev/projects/7141/badge"></a>
+	&nbsp;
+	<a href="https://pkg.go.dev/github.com/caddyserver/caddy/v2"><img src="https://img.shields.io/badge/godoc-reference-%23007d9c.svg"></a>
+	&nbsp;
+	<a href="https://x.com/caddyserver" title="@caddyserver on Twitter"><img src="https://img.shields.io/twitter/follow/caddyserver" alt="@caddyserver on Twitter"></a>
+	&nbsp;
+	<a href="https://caddy.community" title="Caddy Forum"><img src="https://img.shields.io/badge/community-forum-ff69b4.svg" alt="Caddy Forum"></a>
+	<br>
+	<a href="https://sourcegraph.com/github.com/caddyserver/caddy?badge" title="Caddy on Sourcegraph"><img src="https://sourcegraph.com/github.com/caddyserver/caddy/-/badge.svg" alt="Caddy on Sourcegraph"></a>
+	&nbsp;
+	<a href="https://cloudsmith.io/~caddy/repos/"><img src="https://img.shields.io/badge/OSS%20hosting%20by-cloudsmith-blue?logo=cloudsmith" alt="Cloudsmith"></a>
+</p>
+<p align="center">
+	<b>Powered by</b>
+	<br>
+	<a href="https://github.com/caddyserver/certmagic">
+		<picture>
+			<source media="(prefers-color-scheme: dark)" srcset="https://user-images.githubusercontent.com/55066419/206946718-740b6371-3df3-4d72-a822-47e4c48af999.png">
+			<source media="(prefers-color-scheme: light)" srcset="https://user-images.githubusercontent.com/1128849/49704830-49d37200-fbd5-11e8-8385-767e0cd033c3.png">
+			<img src="https://user-images.githubusercontent.com/1128849/49704830-49d37200-fbd5-11e8-8385-767e0cd033c3.png" alt="CertMagic" width="250">
+		</picture>
+	</a>
+</p>
 
+<!-- Warp sponsorship requests this section -->
+<div align="center" markdown="1">
+	<hr>
+	<sup>Special thanks to:</sup>
+	<br>
+	<a href="https://go.warp.dev/caddy">
+		<img alt="Warp sponsorship" width="400" src="https://github.com/user-attachments/assets/c8efffde-18c7-4af4-83ed-b1aba2dda394">
+	</a>
 
+### [Warp, built for coding with multiple AI agents](https://go.warp.dev/caddy)
+[Available for MacOS, Linux, & Windows](https://go.warp.dev/caddy)<br>
+</div>
+
+<hr>
 
 ### Menu
 
@@ -37,14 +72,8 @@
 - [Getting help](#getting-help)
 - [About](#about)
 
-<p align="center">
-	<b>Powered by</b>
-	<br>
-	<a href="https://github.com/caddyserver/certmagic"><img src="https://user-images.githubusercontent.com/1128849/49704830-49d37200-fbd5-11e8-8385-767e0cd033c3.png" alt="CertMagic" width="250"></a>
-</p>
 
-
-## [Features](https://caddyserver.com/v2)
+## [Features](https://caddyserver.com/features)
 
 - **Easy configuration** with the [Caddyfile](https://caddyserver.com/docs/caddyfile)
 - **Powerful configuration** with its [native JSON config](https://caddyserver.com/docs/json/)
@@ -55,30 +84,31 @@
 	- Fully-managed local CA for internal names & IPs
 	- Can coordinate with other Caddy instances in a cluster
 	- Multi-issuer fallback
+	- Encrypted ClientHello (ECH) support
 - **Stays up when other servers go down** due to TLS/OCSP/certificate-related issues
 - **Production-ready** after serving trillions of requests and managing millions of TLS certificates
-- **Scales to tens of thousands of sites** ... and probably more
-- **HTTP/1.1, HTTP/2, and experimental HTTP/3** support
+- **Scales to hundreds of thousands of sites** as proven in production
+- **HTTP/1.1, HTTP/2, and HTTP/3** all supported by default
 - **Highly extensible** [modular architecture](https://caddyserver.com/docs/architecture) lets Caddy do anything without bloat
 - **Runs anywhere** with **no external dependencies** (not even libc)
 - Written in Go, a language with higher **memory safety guarantees** than other servers
 - Actually **fun to use**
-- So, so much more to [discover](https://caddyserver.com/v2)
+- So much more to [discover](https://caddyserver.com/features)
 
 ## Install
 
-The simplest, cross-platform way is to download from [GitHub Releases](https://github.com/caddyserver/caddy/releases) and place the executable file in your PATH.
+The simplest, cross-platform way to get started is to download Caddy from [GitHub Releases](https://github.com/caddyserver/caddy/releases) and place the executable file in your PATH.
 
-For other install options, see https://caddyserver.com/docs/install.
+See [our online documentation](https://caddyserver.com/docs/install) for other install instructions.
 
 ## Build from source
 
 Requirements:
 
-- [Go 1.16 or newer](https://golang.org/dl/)
+- [Go 1.26.0 or newer](https://golang.org/dl/)
 
 ### For development
- 
+
 _**Note:** These steps [will not embed proper version information](https://github.com/golang/go/issues/29228). For that, please follow the instructions in the next section._
 
 ```bash
@@ -103,11 +133,18 @@ username ALL=(ALL:ALL) NOPASSWD: /usr/sbin/setcap
 
 replacing `username` with your actual username. Please be careful and only do this if you know what you are doing! We are only qualified to document how to use Caddy, not Go tooling or your computer, and we are providing these instructions for convenience only; please learn how to use your own computer at your own risk and make any needful adjustments.
 
+Then you can run the tests in all modules or a specific one:
+
+```bash
+$ go test ./...
+$ go test ./modules/caddyhttp/tracing/
+```
+
 ### With version information and/or plugins
 
 Using [our builder tool, `xcaddy`](https://github.com/caddyserver/xcaddy)...
 
-```
+```bash
 $ xcaddy build
 ```
 
@@ -119,7 +156,7 @@ $ xcaddy build
 4. Initialize a Go module: `go mod init caddy`
 5. (Optional) Pin Caddy version: `go get github.com/caddyserver/caddy/v2@version` replacing `version` with a git tag, commit, or branch name.
 6. (Optional) Add plugins by adding their import: `_ "import/path/here"`
-7. Compile: `go build`
+7. Compile: `go build -tags=nobadger,nomysql,nopgx`
 
 
 
@@ -164,9 +201,9 @@ The docs are also open source. You can contribute to them here: https://github.c
 
 ## Getting help
 
-- We **strongly recommend** that all professionals or companies using Caddy get a support contract through [Ardan Labs](https://www.ardanlabs.com/my/contact-us?dd=caddy) before help is needed.
+- We advise companies using Caddy to secure a support contract through [Ardan Labs](https://www.ardanlabs.com) before help is needed.
 
-- A [sponsorship](https://github.com/sponsors/mholt) goes a long way! If Caddy is benefitting your company, please consider a sponsorship! This not only helps fund full-time work to ensure the longevity of the project, it's also a great look for your company to your customers and potential customers!
+- A [sponsorship](https://github.com/sponsors/mholt) goes a long way! We can offer private help to sponsors. If Caddy is benefitting your company, please consider a sponsorship. This not only helps fund full-time work to ensure the longevity of the project, it provides your company the resources, support, and discounts you need; along with being a great look for your company to your customers and potential customers!
 
 - Individuals can exchange help for free on our community forum at https://caddy.community. Remember that people give help out of their spare time and good will. The best way to get help is to give it first!
 
@@ -180,9 +217,9 @@ Matthew Holt began developing Caddy in 2014 while studying computer science at B
 
 **The name "Caddy" is trademarked.** The name of the software is "Caddy", not "Caddy Server" or "CaddyServer". Please call it "Caddy" or, if you wish to clarify, "the Caddy web server". Caddy is a registered trademark of Stack Holdings GmbH.
 
-- _Project on Twitter: [@caddyserver](https://twitter.com/caddyserver)_
-- _Author on Twitter: [@mholt6](https://twitter.com/mholt6)_
+- _Project on X: [@caddyserver](https://x.com/caddyserver)_
+- _Author on X: [@mholt6](https://x.com/mholt6)_
 
-Caddy is a project of [ZeroSSL](https://zerossl.com), a Stack Holdings company.
+Caddy is a project of [ZeroSSL](https://zerossl.com), an HID Global company.
 
 Debian package repository hosting is graciously provided by [Cloudsmith](https://cloudsmith.com). Cloudsmith is the only fully hosted, cloud-native, universal package management solution, that enables your organization to create, store and share packages in any format, to any place, with total confidence.

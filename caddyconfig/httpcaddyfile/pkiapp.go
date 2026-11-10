@@ -15,159 +15,204 @@
 package httpcaddyfile
 
 import (
+	"slices"
+	"strconv"
+
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddypki"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
 func init() {
 	RegisterGlobalOption("pki", parsePKIApp)
 }
 
-// parsePKIApp parses the global log option. Syntax:
+// parsePKIApp parses the global pki option. Syntax:
 //
-//     pki {
-//         ca [<id>] {
-//             name            <name>
-//             root_cn         <name>
-//             intermediate_cn <name>
-//             root {
-//                 cert   <path>
-//                 key    <path>
-//                 format <format>
-//             }
-//             intermediate {
-//                 cert   <path>
-//                 key    <path>
-//                 format <format>
-//             }
-//         }
-//     }
+//	pki {
+//	    ca [<id>] {
+//	        name                    <name>
+//	        root_cn                 <name>
+//	        intermediate_cn         <name>
+//	        intermediate_lifetime   <duration>
+//	        maintenance_interval    <duration>
+//	        renewal_window_ratio    <ratio>
+//	        root {
+//	            cert   <path>
+//	            key    <path>
+//	            format <format>
+//	        }
+//	        intermediate {
+//	            cert   <path>
+//	            key    <path>
+//	            format <format>
+//	        }
+//	    }
+//	}
 //
 // When the CA ID is unspecified, 'local' is assumed.
-//
-func parsePKIApp(d *caddyfile.Dispenser, existingVal interface{}) (interface{}, error) {
-	pki := &caddypki.PKI{CAs: make(map[string]*caddypki.CA)}
+func parsePKIApp(d *caddyfile.Dispenser, existingVal any) (any, error) {
+	d.Next() // consume app name
 
-	for d.Next() {
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			switch d.Val() {
-			case "ca":
-				pkiCa := new(caddypki.CA)
+	pki := &caddypki.PKI{
+		CAs: make(map[string]*caddypki.CA),
+	}
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "ca":
+			pkiCa := new(caddypki.CA)
+			if d.NextArg() {
+				pkiCa.ID = d.Val()
 				if d.NextArg() {
-					pkiCa.ID = d.Val()
-					if d.NextArg() {
+					return nil, d.ArgErr()
+				}
+			}
+			if pkiCa.ID == "" {
+				pkiCa.ID = caddypki.DefaultCAID
+			}
+
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				switch d.Val() {
+				case "name":
+					if !d.NextArg() {
 						return nil, d.ArgErr()
 					}
-				}
-				if pkiCa.ID == "" {
-					pkiCa.ID = caddypki.DefaultCAID
-				}
+					pkiCa.Name = d.Val()
 
-				for nesting := d.Nesting(); d.NextBlock(nesting); {
-					switch d.Val() {
-					case "name":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						pkiCa.Name = d.Val()
-
-					case "root_cn":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						pkiCa.RootCommonName = d.Val()
-
-					case "intermediate_cn":
-						if !d.NextArg() {
-							return nil, d.ArgErr()
-						}
-						pkiCa.IntermediateCommonName = d.Val()
-
-					case "root":
-						if pkiCa.Root == nil {
-							pkiCa.Root = new(caddypki.KeyPair)
-						}
-						for nesting := d.Nesting(); d.NextBlock(nesting); {
-							switch d.Val() {
-							case "cert":
-								if !d.NextArg() {
-									return nil, d.ArgErr()
-								}
-								pkiCa.Root.Certificate = d.Val()
-
-							case "key":
-								if !d.NextArg() {
-									return nil, d.ArgErr()
-								}
-								pkiCa.Root.PrivateKey = d.Val()
-
-							case "format":
-								if !d.NextArg() {
-									return nil, d.ArgErr()
-								}
-								pkiCa.Root.Format = d.Val()
-
-							default:
-								return nil, d.Errf("unrecognized pki ca root option '%s'", d.Val())
-							}
-						}
-
-					case "intermediate":
-						if pkiCa.Intermediate == nil {
-							pkiCa.Intermediate = new(caddypki.KeyPair)
-						}
-						for nesting := d.Nesting(); d.NextBlock(nesting); {
-							switch d.Val() {
-							case "cert":
-								if !d.NextArg() {
-									return nil, d.ArgErr()
-								}
-								pkiCa.Intermediate.Certificate = d.Val()
-
-							case "key":
-								if !d.NextArg() {
-									return nil, d.ArgErr()
-								}
-								pkiCa.Intermediate.PrivateKey = d.Val()
-
-							case "format":
-								if !d.NextArg() {
-									return nil, d.ArgErr()
-								}
-								pkiCa.Intermediate.Format = d.Val()
-
-							default:
-								return nil, d.Errf("unrecognized pki ca intermediate option '%s'", d.Val())
-							}
-						}
-
-					default:
-						return nil, d.Errf("unrecognized pki ca option '%s'", d.Val())
+				case "root_cn":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
 					}
+					pkiCa.RootCommonName = d.Val()
+
+				case "intermediate_cn":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					pkiCa.IntermediateCommonName = d.Val()
+
+				case "intermediate_lifetime":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return nil, err
+					}
+					pkiCa.IntermediateLifetime = caddy.Duration(dur)
+
+				case "maintenance_interval":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return nil, err
+					}
+					pkiCa.MaintenanceInterval = caddy.Duration(dur)
+
+				case "renewal_window_ratio":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					ratio, err := strconv.ParseFloat(d.Val(), 64)
+					if err != nil || ratio <= 0 || ratio > 1 {
+						return nil, d.Errf("renewal_window_ratio must be a number in (0, 1], got %s", d.Val())
+					}
+					pkiCa.RenewalWindowRatio = ratio
+
+				case "root":
+					if pkiCa.Root == nil {
+						pkiCa.Root = new(caddypki.KeyPair)
+					}
+					for nesting := d.Nesting(); d.NextBlock(nesting); {
+						switch d.Val() {
+						case "cert":
+							if !d.NextArg() {
+								return nil, d.ArgErr()
+							}
+							pkiCa.Root.Certificate = d.Val()
+
+						case "key":
+							if !d.NextArg() {
+								return nil, d.ArgErr()
+							}
+							pkiCa.Root.PrivateKey = d.Val()
+
+						case "format":
+							if !d.NextArg() {
+								return nil, d.ArgErr()
+							}
+							pkiCa.Root.Format = d.Val()
+
+						default:
+							return nil, d.Errf("unrecognized pki ca root option '%s'", d.Val())
+						}
+					}
+
+				case "intermediate":
+					if pkiCa.Intermediate == nil {
+						pkiCa.Intermediate = new(caddypki.KeyPair)
+					}
+					for nesting := d.Nesting(); d.NextBlock(nesting); {
+						switch d.Val() {
+						case "cert":
+							if !d.NextArg() {
+								return nil, d.ArgErr()
+							}
+							pkiCa.Intermediate.Certificate = d.Val()
+
+						case "key":
+							if !d.NextArg() {
+								return nil, d.ArgErr()
+							}
+							pkiCa.Intermediate.PrivateKey = d.Val()
+
+						case "format":
+							if !d.NextArg() {
+								return nil, d.ArgErr()
+							}
+							pkiCa.Intermediate.Format = d.Val()
+
+						default:
+							return nil, d.Errf("unrecognized pki ca intermediate option '%s'", d.Val())
+						}
+					}
+
+				default:
+					return nil, d.Errf("unrecognized pki ca option '%s'", d.Val())
 				}
-
-				pki.CAs[pkiCa.ID] = pkiCa
-
-			default:
-				return nil, d.Errf("unrecognized pki option '%s'", d.Val())
 			}
+
+			pki.CAs[pkiCa.ID] = pkiCa
+
+		default:
+			return nil, d.Errf("unrecognized pki option '%s'", d.Val())
 		}
 	}
-
 	return pki, nil
 }
 
 func (st ServerType) buildPKIApp(
 	pairings []sbAddrAssociation,
-	options map[string]interface{},
+	options map[string]any,
 	warnings []caddyconfig.Warning,
 ) (*caddypki.PKI, []caddyconfig.Warning, error) {
-
 	skipInstallTrust := false
 	if _, ok := options["skip_install_trust"]; ok {
 		skipInstallTrust = true
 	}
+
+	// check if auto_https is off - in that case we should not create
+	// any PKI infrastructure even with skip_install_trust directive
+	autoHTTPS := []string{}
+	if ah, ok := options["auto_https"].([]string); ok {
+		autoHTTPS = ah
+	}
+	autoHTTPSOff := slices.Contains(autoHTTPS, "off")
+
 	falseBool := false
 
 	// Load the PKI app configured via global options
@@ -208,11 +253,40 @@ func (st ServerType) buildPKIApp(
 	// if there was no CAs defined in any of the servers,
 	// and we were requested to not install trust, then
 	// add one for the default/local CA to do so
-	if len(pkiApp.CAs) == 0 && skipInstallTrust {
+	// only if auto_https is not completely disabled
+	if len(pkiApp.CAs) == 0 && skipInstallTrust && !autoHTTPSOff {
 		ca := new(caddypki.CA)
 		ca.ID = caddypki.DefaultCAID
 		ca.InstallTrust = &falseBool
 		pkiApp.CAs[ca.ID] = ca
+	}
+
+	// an explicit site-level internal issuer creates its own CA
+	// regardless of `auto_https`, so make sure `skip_install_trust`
+	// is honored for it too; otherwise the CA is created later at
+	// runtime with trust installation left on
+	if skipInstallTrust {
+		for _, p := range pairings {
+			for _, sblock := range p.serverBlocks {
+				for _, issuerCfgValue := range sblock.pile["tls.cert_issuer"] {
+					internalIssuer, ok := issuerCfgValue.Value.(*caddytls.InternalIssuer)
+					if !ok {
+						continue
+					}
+					caID := internalIssuer.CA
+					if caID == "" {
+						caID = caddypki.DefaultCAID
+					}
+					if _, ok := pkiApp.CAs[caID]; ok {
+						continue
+					}
+					ca := new(caddypki.CA)
+					ca.ID = caID
+					ca.InstallTrust = &falseBool
+					pkiApp.CAs[ca.ID] = ca
+				}
+			}
+		}
 	}
 
 	return pkiApp, warnings, nil

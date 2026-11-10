@@ -13,9 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/caddytest"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+
+	"github.com/caddyserver/caddy/v2/caddytest"
 )
 
 // (see https://github.com/caddyserver/caddy/issues/3556 for use case)
@@ -23,10 +24,14 @@ func TestH2ToH2CStream(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(` 
   {
+	"admin": {
+		"listen": "localhost:2999"
+	},
     "apps": {
       "http": {
         "http_port": 9080,
         "https_port": 9443,
+		"grace_period": 1,
         "servers": {
           "srv0": {
             "listen": [
@@ -123,8 +128,8 @@ func TestH2ToH2CStream(t *testing.T) {
 	// Disable any compression method from server.
 	req.Header.Set("Accept-Encoding", "identity")
 
-	resp := tester.AssertResponseCode(req, 200)
-	if 200 != resp.StatusCode {
+	resp := tester.AssertResponseCode(req, http.StatusOK)
+	if resp.StatusCode != http.StatusOK {
 		return
 	}
 	go func() {
@@ -143,7 +148,6 @@ func TestH2ToH2CStream(t *testing.T) {
 	if !strings.Contains(body, expectedBody) {
 		t.Errorf("requesting \"%s\" expected response body \"%s\" but got \"%s\"", req.RequestURI, expectedBody, body)
 	}
-	return
 }
 
 func testH2ToH2CStreamServeH2C(t *testing.T) *http.Server {
@@ -155,7 +159,7 @@ func testH2ToH2CStreamServeH2C(t *testing.T) *http.Server {
 		}
 		// We only accept HTTP/2!
 		if r.ProtoMajor != 2 {
-			t.Error("Not a HTTP/2 request, rejected!")
+			t.Error("Not an HTTP/2 request, rejected!")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -173,9 +177,7 @@ func testH2ToH2CStreamServeH2C(t *testing.T) *http.Server {
 
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(200)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
+		http.NewResponseController(w).Flush()
 
 		buf := make([]byte, 4*1024)
 
@@ -206,6 +208,9 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
 	tester := caddytest.NewTester(t)
 	tester.InitServer(` 
 {
+	"admin": {
+		"listen": "localhost:2999"
+	},
   "logging": {
     "logs": {
       "default": {
@@ -217,6 +222,7 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
     "http": {
       "http_port": 9080,
       "https_port": 9443,
+	  "grace_period": 1,
       "servers": {
         "srv0": {
           "listen": [
@@ -329,14 +335,14 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
 		ProtoMinor: 0,
 		Header:     make(http.Header),
 	}
-	// underlying transport will automaticlly add gzip
+	// underlying transport will automatically add gzip
 	// req.Header.Set("Accept-Encoding", "gzip")
 	go func() {
 		fmt.Fprint(w, expectedBody)
 		w.Close()
 	}()
-	resp := tester.AssertResponseCode(req, 200)
-	if 200 != resp.StatusCode {
+	resp := tester.AssertResponseCode(req, http.StatusOK)
+	if resp.StatusCode != http.StatusOK {
 		return
 	}
 
@@ -351,12 +357,10 @@ func TestH2ToH1ChunkedResponse(t *testing.T) {
 	if body != expectedBody {
 		t.Errorf("requesting \"%s\" expected response body \"%s\" but got \"%s\"", req.RequestURI, expectedBody, body)
 	}
-	return
 }
 
 func testH2ToH1ChunkedResponseServeH1(t *testing.T) *http.Server {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
 		if r.Host != "127.0.0.1:9443" {
 			t.Errorf("r.Host doesn't match, %v!", r.Host)
 			w.WriteHeader(http.StatusNotFound)

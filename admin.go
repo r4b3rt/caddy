@@ -25,6 +25,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"net/http"
@@ -33,17 +34,39 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/notify"
 	"github.com/caddyserver/certmagic"
+	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/net/http/httpguts"
+
+	"github.com/caddyserver/caddy/v2/caddyconfig/warning"
+	"github.com/caddyserver/caddy/v2/internal"
 )
+
+// testCertMagicStorageOverride is a package-level test hook. Tests may set
+// this variable to provide a temporary certmagic.Storage so that cert
+// management in tests does not hit the real default storage on disk.
+// This must NOT be set in production code.
+var testCertMagicStorageOverride certmagic.Storage
+
+func init() {
+	// The hard-coded default `DefaultAdminListen` can be overridden
+	// by setting the `CADDY_ADMIN` environment variable.
+	// The environment variable may be used by packagers to change
+	// the default admin address to something more appropriate for
+	// that platform. See #5317 for discussion.
+	if env, exists := os.LookupEnv("CADDY_ADMIN"); exists {
+		DefaultAdminListen = env
+	}
+}
 
 // AdminConfig configures Caddy's API endpoint, which is used
 // to manage Caddy while it is running.
@@ -56,7 +79,14 @@ type AdminConfig struct {
 
 	// The address to which the admin endpoint's listener should
 	// bind itself. Can be any single network address that can be
-	// parsed by Caddy. Default: localhost:2019
+	// parsed by Caddy. Accepts placeholders.
+	// Default: the value of the `CADDY_ADMIN` environment variable,
+	// or `localhost:2019` otherwise.
+	//
+	// Remember: When changing this value through a config reload,
+	// be sure to use the `--address` CLI flag to specify the current
+	// admin address if the currently-running admin endpoint is not
+	// the default address.
 	Listen string `json:"listen,omitempty"`
 
 	// If true, CORS headers will be emitted, and requests to the
@@ -92,10 +122,6 @@ type AdminConfig struct {
 	//
 	// EXPERIMENTAL: This feature is subject to change.
 	Remote *RemoteAdmin `json:"remote,omitempty"`
-
-	// Holds onto the routers so that we can later provision them
-	// if they require provisioning.
-	routers []AdminRouter
 }
 
 // ConfigSettings configures the management of configuration.
@@ -155,7 +181,7 @@ type IdentityConfig struct {
 //
 // EXPERIMENTAL: Subject to change.
 type RemoteAdmin struct {
-	// The address on which to start the secure listener.
+	// The address on which to start the secure listener. Accepts placeholders.
 	// Default: :2021
 	Listen string `json:"listen,omitempty"`
 
@@ -184,8 +210,8 @@ type AdminAccess struct {
 // AdminPermissions specifies what kinds of requests are allowed
 // to be made to the admin endpoint.
 type AdminPermissions struct {
-	// The API paths allowed. Paths are simple prefix matches.
-	// Any subpath of the specified paths will be allowed.
+	// The API paths allowed. A request path must either equal an
+	// allowed path or be a subpath with a path-segment boundary.
 	Paths []string `json:"paths,omitempty"`
 
 	// The HTTP methods allowed for the given paths.
@@ -194,14 +220,15 @@ type AdminPermissions struct {
 
 // newAdminHandler reads admin's config and returns an http.Handler suitable
 // for use in an admin endpoint server, which will be listening on listenAddr.
-func (admin *AdminConfig) newAdminHandler(addr NetworkAddress, remote bool) adminHandler {
+func (admin *AdminConfig) newAdminHandler(addr NetworkAddress, remote bool, ctx Context) (adminHandler, error) {
 	muxWrap := adminHandler{mux: http.NewServeMux()}
 
 	// secure the local or remote endpoint respectively
 	if remote {
 		muxWrap.remoteControl = admin.Remote
 	} else {
-		muxWrap.enforceHost = !addr.isWildcardInterface()
+		// see comment in allowedOrigins() as to why we disable the host check for unix/fd networks
+		muxWrap.enforceHost = !addr.isWildcardInterface() && !addr.IsUnixNetwork() && !addr.IsFdNetwork()
 		muxWrap.allowedOrigins = admin.allowedOrigins(addr)
 		muxWrap.enforceOrigin = admin.EnforceOrigin
 	}
@@ -250,35 +277,21 @@ func (admin *AdminConfig) newAdminHandler(addr NetworkAddress, remote bool) admi
 	// register third-party module endpoints
 	for _, m := range GetModules("admin.api") {
 		router := m.New().(AdminRouter)
-		handlerLabel := m.ID.Name()
+
+		// provision the router before registering its routes, so
+		// handlers have access to all provisioned state
+		if provisioner, ok := router.(Provisioner); ok {
+			if err := provisioner.Provision(ctx); err != nil {
+				return adminHandler{}, fmt.Errorf("provisioning admin router module %s: %v", m.ID, err)
+			}
+		}
+
 		for _, route := range router.Routes() {
 			addRoute(route.Pattern, handlerLabel, route.Handler)
 		}
-		admin.routers = append(admin.routers, router)
 	}
 
-	return muxWrap
-}
-
-// provisionAdminRouters provisions all the router modules
-// in the admin.api namespace that need provisioning.
-func (admin *AdminConfig) provisionAdminRouters(ctx Context) error {
-	for _, router := range admin.routers {
-		provisioner, ok := router.(Provisioner)
-		if !ok {
-			continue
-		}
-
-		err := provisioner.Provision(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
-	// We no longer need the routers once provisioned, allow for GC
-	admin.routers = nil
-
-	return nil
+	return muxWrap, nil
 }
 
 // allowedOrigins returns a list of origins that are allowed.
@@ -291,22 +304,43 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 	for _, o := range admin.Origins {
 		uniqueOrigins[o] = struct{}{}
 	}
-	if admin.Origins == nil {
+	// RFC 2616, Section 14.26:
+	// "A client MUST include a Host header field in all HTTP/1.1 request
+	// messages. If the requested URI does not include an Internet host
+	// name for the service being requested, then the Host header field MUST
+	// be given with an empty value."
+	//
+	// UPDATE July 2023: Go broke this by patching a minor security bug in 1.20.6.
+	// Understandable, but frustrating. See:
+	// https://github.com/golang/go/issues/60374
+	// See also the discussion here:
+	// https://github.com/golang/go/issues/61431
+	//
+	// We can no longer conform to RFC 2616 Section 14.26 from either Go or curl
+	// in purity. (Curl allowed no host between 7.40 and 7.50, but now requires a
+	// bogus host; see https://superuser.com/a/925610.) If we disable Host/Origin
+	// security checks, the infosec community assures me that it is secure to do
+	// so, because:
+	//
+	// 1) Browsers do not allow access to unix sockets
+	// 2) DNS is irrelevant to unix sockets
+	//
+	// If either of those two statements ever fail to hold true, it is not the
+	// fault of Caddy.
+	//
+	// Thus, we do not fill out allowed origins and do not enforce Host
+	// requirements for unix sockets. Enforcing it leads to confusion and
+	// frustration, when UDS have their own permissions from the OS.
+	// Enforcing host requirements here is effectively security theater,
+	// and a false sense of security.
+	//
+	// See also the discussion in #6832.
+	if admin.Origins == nil && !addr.IsUnixNetwork() && !addr.IsFdNetwork() {
 		if addr.isLoopback() {
-			if addr.IsUnixNetwork() {
-				// RFC 2616, Section 14.26:
-				// "A client MUST include a Host header field in all HTTP/1.1 request
-				// messages. If the requested URI does not include an Internet host
-				// name for the service being requested, then the Host header field MUST
-				// be given with an empty value."
-				uniqueOrigins[""] = struct{}{}
-			} else {
-				uniqueOrigins[net.JoinHostPort("localhost", addr.port())] = struct{}{}
-				uniqueOrigins[net.JoinHostPort("::1", addr.port())] = struct{}{}
-				uniqueOrigins[net.JoinHostPort("127.0.0.1", addr.port())] = struct{}{}
-			}
-		}
-		if !addr.IsUnixNetwork() {
+			uniqueOrigins[net.JoinHostPort("localhost", addr.port())] = struct{}{}
+			uniqueOrigins[net.JoinHostPort("::1", addr.port())] = struct{}{}
+			uniqueOrigins[net.JoinHostPort("127.0.0.1", addr.port())] = struct{}{}
+		} else {
 			uniqueOrigins[addr.JoinHostPort(0)] = struct{}{}
 		}
 	}
@@ -337,18 +371,22 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 // for the admin endpoint exists in cfg, a default one is used, so
 // that there is always an admin server (unless it is explicitly
 // configured to be disabled).
-func replaceLocalAdminServer(cfg *Config) error {
-	// always be sure to close down the old admin endpoint
+// Critically note that some elements and functionality of the context
+// may not be ready, e.g. storage. Tread carefully.
+func replaceLocalAdminServer(cfg *Config, ctx Context) error {
+	// always* be sure to close down the old admin endpoint
 	// as gracefully as possible, even if the new one is
 	// disabled -- careful to use reference to the current
 	// (old) admin endpoint since it will be different
 	// when the function returns
+	// (* except if the new one fails to start)
 	oldAdminServer := localAdminServer
+	var err error
 	defer func() {
 		// do the shutdown asynchronously so that any
 		// current API request gets a response; this
 		// goroutine may last a few seconds
-		if oldAdminServer != nil {
+		if oldAdminServer != nil && err == nil {
 			go func(oldAdminServer *http.Server) {
 				err := stopAdminServer(oldAdminServer)
 				if err != nil {
@@ -377,9 +415,12 @@ func replaceLocalAdminServer(cfg *Config) error {
 		return err
 	}
 
-	handler := cfg.Admin.newAdminHandler(addr, false)
+	handler, err := cfg.Admin.newAdminHandler(addr, false, ctx)
+	if err != nil {
+		return err
+	}
 
-	ln, err := Listen(addr.Network, addr.JoinHostPort(0))
+	ln, err := addr.Listen(context.TODO(), 0, net.ListenConfig{})
 	if err != nil {
 		return err
 	}
@@ -400,7 +441,7 @@ func replaceLocalAdminServer(cfg *Config) error {
 		serverMu.Lock()
 		server := localAdminServer
 		serverMu.Unlock()
-		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(ln.(net.Listener)); !errors.Is(err, http.ErrServerClosed) {
 			adminLogger.Error("admin server shutdown for unknown reason", zap.Error(err))
 		}
 	}()
@@ -428,7 +469,6 @@ func manageIdentity(ctx Context, cfg *Config) error {
 	// import the caddytls package -- but it works
 	if cfg.Admin.Identity.IssuersRaw == nil {
 		cfg.Admin.Identity.IssuersRaw = []json.RawMessage{
-			json.RawMessage(`{"module": "zerossl"}`),
 			json.RawMessage(`{"module": "acme"}`),
 		}
 	}
@@ -439,7 +479,7 @@ func manageIdentity(ctx Context, cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("loading identity issuer modules: %s", err)
 		}
-		for _, issVal := range val.([]interface{}) {
+		for _, issVal := range val.([]any) {
 			cfg.Admin.Identity.issuers = append(cfg.Admin.Identity.issuers, issVal.(certmagic.Issuer))
 		}
 	}
@@ -499,7 +539,10 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 
 	// make the HTTP handler but disable Host/Origin enforcement
 	// because we are using TLS authentication instead
-	handler := cfg.Admin.newAdminHandler(addr, true)
+	handler, err := cfg.Admin.newAdminHandler(addr, true, ctx)
+	if err != nil {
+		return err
+	}
 
 	// create client certificate pool for TLS mutual auth, and extract public keys
 	// so that we can enforce access controls at the application layer
@@ -512,6 +555,18 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 			}
 			accessControl.publicKeys = append(accessControl.publicKeys, cert.PublicKey)
 			clientCertPool.AddCert(cert)
+		}
+		for j, perm := range accessControl.Permissions {
+			for _, permPath := range perm.Paths {
+				if permPath == "" || permPath == "/" {
+					continue
+				}
+				cleanPath := path.Clean(permPath)
+				hasCanonicalTrailingSlash := cleanPath != "/" && strings.TrimSuffix(permPath, "/") == cleanPath
+				if cleanPath != permPath && !hasCanonicalTrailingSlash {
+					return fmt.Errorf("access control %d permission %d: path %q is not canonical (did you mean %q?)", i, j, permPath, cleanPath)
+				}
+			}
 		}
 	}
 
@@ -546,10 +601,11 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 	serverMu.Unlock()
 
 	// start listener
-	ln, err := Listen(addr.Network, addr.JoinHostPort(0))
+	lnAny, err := addr.Listen(ctx, 0, net.ListenConfig{})
 	if err != nil {
 		return err
 	}
+	ln := lnAny.(net.Listener)
 	ln = tls.NewListener(ln, tlsConfig)
 
 	go func() {
@@ -568,13 +624,25 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 }
 
 func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool) *certmagic.Config {
+	var cmCfg *certmagic.Config
 	if ident == nil {
 		// user might not have configured identity; that's OK, we can still make a
 		// certmagic config, although it'll be mostly useless for remote management
 		ident = new(IdentityConfig)
 	}
-	cmCfg := &certmagic.Config{
-		Storage: DefaultStorage, // do not act as part of a cluster (this is for the server's local identity)
+	// Choose storage: prefer the package-level test override when present,
+	// otherwise use the configured DefaultStorage. Tests may set an override
+	// to divert storage into a temporary location. Otherwise, in production
+	// we use the DefaultStorage since we don't want to act as part of a
+	// cluster; this storage is for the server's local identity only.
+	var storage certmagic.Storage
+	if testCertMagicStorageOverride != nil {
+		storage = testCertMagicStorageOverride
+	} else {
+		storage = DefaultStorage
+	}
+	template := certmagic.Config{
+		Storage: storage,
 		Logger:  logger,
 		Issuers: ident.issuers,
 	}
@@ -583,9 +651,11 @@ func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool)
 			GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
 				return cmCfg, nil
 			},
+			Logger: logger.Named("cache"),
 		})
 	}
-	return certmagic.New(identityCertCache, *cmCfg)
+	cmCfg = certmagic.New(identityCertCache, template)
+	return cmCfg
 }
 
 // IdentityCredentials returns this instance's configured, managed identity credentials
@@ -610,6 +680,10 @@ func (ctx Context) IdentityCredentials(logger *zap.Logger) ([]tls.Certificate, e
 // trust, and then looks for a matching, authorized public key that is allowed to access
 // the defined path(s) using the defined method(s).
 func (remote RemoteAdmin) enforceAccessControls(r *http.Request) error {
+	// the same public key may appear in more than one access control entry;
+	// the request is allowed if any entry containing the key permits it
+	var keyRecognized, pathAllowedSomewhere bool
+
 	for _, chain := range r.TLS.VerifiedChains {
 		for _, peerCert := range chain {
 			for _, adminAccess := range remote.AccessControl {
@@ -622,44 +696,55 @@ func (remote RemoteAdmin) enforceAccessControls(r *http.Request) error {
 					if !ok || !comparer.Equal(allowedKey) {
 						continue
 					}
+					keyRecognized = true
 
 					// key recognized; make sure its HTTP request is permitted
+					// by at least one of the permission entries (if none are
+					// configured, all permissions are granted)
+					if len(adminAccess.Permissions) == 0 {
+						return nil
+					}
 					for _, accessPerm := range adminAccess.Permissions {
-						// verify method
-						methodFound := accessPerm.Methods == nil
-						for _, method := range accessPerm.Methods {
-							if method == r.Method {
-								methodFound = true
-								break
-							}
-						}
-						if !methodFound {
-							return APIError{
-								HTTPStatus: http.StatusForbidden,
-								Message:    "not authorized to use this method",
-							}
-						}
-
 						// verify path
 						pathFound := accessPerm.Paths == nil
 						for _, allowedPath := range accessPerm.Paths {
-							if strings.HasPrefix(r.URL.Path, allowedPath) {
+							if adminPathAllowed(r.URL.Path, allowedPath) {
 								pathFound = true
 								break
 							}
 						}
 						if !pathFound {
-							return APIError{
-								HTTPStatus: http.StatusForbidden,
-								Message:    "not authorized to access this path",
-							}
+							continue
+						}
+						pathAllowedSomewhere = true
+
+						// verify method
+						if accessPerm.Methods == nil || slices.Contains(accessPerm.Methods, r.Method) {
+							// public key authorized, method and path allowed
+							return nil
 						}
 					}
 
-					// public key authorized, method and path allowed
-					return nil
+					// this entry does not permit the request; other entries
+					// containing the same key may
+					break
 				}
 			}
+		}
+	}
+
+	if keyRecognized {
+		// no entry allows this request; if the path is allowed by
+		// some entry, the method is what's missing
+		if pathAllowedSomewhere {
+			return APIError{
+				HTTPStatus: http.StatusForbidden,
+				Message:    "not authorized to use this method",
+			}
+		}
+		return APIError{
+			HTTPStatus: http.StatusForbidden,
+			Message:    "not authorized to access this path",
 		}
 	}
 
@@ -672,14 +757,35 @@ func (remote RemoteAdmin) enforceAccessControls(r *http.Request) error {
 	}
 }
 
+func adminPathAllowed(reqPath, allowedPath string) bool {
+	reqPathHadTrailingSlash := strings.HasSuffix(reqPath, "/")
+	reqPath = path.Clean(reqPath)
+	if allowedPath == "" {
+		return true
+	}
+	allowedPathHadTrailingSlash := allowedPath != "/" && strings.HasSuffix(allowedPath, "/")
+	allowedPath = path.Clean(allowedPath)
+	if allowedPath == "/" {
+		return true
+	}
+	if reqPath == allowedPath {
+		return !allowedPathHadTrailingSlash || reqPathHadTrailingSlash
+	}
+	return strings.HasPrefix(reqPath, allowedPath+"/")
+}
+
 func stopAdminServer(srv *http.Server) error {
 	if srv == nil {
 		return fmt.Errorf("no admin server")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	timeout := 10 * time.Second
+	ctx, cancel := context.WithTimeoutCause(context.Background(), timeout, fmt.Errorf("stopping admin server: %ds timeout", int(timeout.Seconds())))
 	defer cancel()
 	err := srv.Shutdown(ctx)
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.DeadlineExceeded) {
+			err = cause
+		}
 		return fmt.Errorf("shutting down admin server: %v", err)
 	}
 	Log().Named("admin").Info("stopped previous server", zap.String("address", srv.Addr))
@@ -723,7 +829,7 @@ func (h adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		zap.String("uri", r.RequestURI),
 		zap.String("remote_ip", ip),
 		zap.String("remote_port", port),
-		zap.Reflect("headers", r.Header),
+		zap.Object("headers", internal.LoggableHTTPHeader{Header: r.Header}),
 	)
 	if r.TLS != nil {
 		log = log.With(
@@ -751,11 +857,37 @@ func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// common mitigations in browser contexts
 	if strings.Contains(r.Header.Get("Upgrade"), "websocket") {
 		// I've never been able demonstrate a vulnerability myself, but apparently
 		// WebSocket connections originating from browsers aren't subject to CORS
 		// restrictions, so we'll just be on the safe side
-		h.handleError(w, r, fmt.Errorf("websocket connections aren't allowed"))
+		h.handleError(w, r, APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("websocket connections aren't allowed"),
+			Message:    "WebSocket connections aren't allowed.",
+		})
+		return
+	}
+	if strings.Contains(r.Header.Get("Sec-Fetch-Mode"), "no-cors") {
+		// turns out web pages can just disable the same-origin policy (!???!?)
+		// but at least browsers let us know that's the case, holy heck
+		h.handleError(w, r, APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("client attempted to make request by disabling same-origin policy using no-cors mode"),
+			Message:    "Disabling same-origin restrictions is not allowed.",
+		})
+		return
+	}
+	if r.Header.Get("Origin") == "null" {
+		// bug in Firefox in certain cross-origin situations (yikes?)
+		// (not strictly a security vuln on its own, but it's red flaggy,
+		// since it seems to manifest in cross-origin contexts)
+		h.handleError(w, r, APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        errors.New("invalid origin 'null'"),
+			Message:    "Buggy browser is sending null Origin header.",
+		})
 		return
 	}
 
@@ -768,7 +900,9 @@ func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if h.enforceOrigin {
+	_, hasOriginHeader := r.Header["Origin"]
+	_, hasSecHeader := r.Header["Sec-Fetch-Mode"]
+	if h.enforceOrigin || hasOriginHeader || hasSecHeader {
 		// cross-site mitigation
 		origin, err := h.checkOrigin(r)
 		if err != nil {
@@ -828,13 +962,11 @@ func (h adminHandler) handleError(w http.ResponseWriter, r *http.Request, err er
 // a trustworthy/expected value. This helps to mitigate DNS
 // rebinding attacks.
 func (h adminHandler) checkHost(r *http.Request) error {
-	var allowed bool
-	for _, allowedOrigin := range h.allowedOrigins {
-		if r.Host == allowedOrigin.Host {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.ContainsFunc(h.allowedOrigins, func(u *url.URL) bool {
+		// Host comparison is case-insensitive per RFC 3986 §3.2.2, same as
+		// the Origin check below; url.Parse does not normalize host case.
+		return strings.EqualFold(r.Host, u.Host)
+	})
 	if !allowed {
 		return APIError{
 			HTTPStatus: http.StatusForbidden,
@@ -887,21 +1019,58 @@ func (h adminHandler) originAllowed(origin *url.URL) bool {
 		if allowedOrigin.Scheme != "" && origin.Scheme != allowedOrigin.Scheme {
 			continue
 		}
-		if origin.Host == allowedOrigin.Host {
+		// Host comparison is case-insensitive per RFC 3986 §3.2.2; url.Parse
+		// does not normalize host case, so fold it here.
+		if strings.EqualFold(origin.Host, allowedOrigin.Host) {
 			return true
 		}
 	}
 	return false
 }
 
+// etagHasher returns the hasher we used on the config to both
+// produce and verify ETags.
+func etagHasher() hash.Hash { return xxhash.New() }
+
+// makeEtag returns an Etag header value (including quotes) for
+// the given config path and hash of contents at that path.
+func makeEtag(path string, hash hash.Hash) string {
+	return fmt.Sprintf(`"%s %x"`, path, hash.Sum(nil))
+}
+
+// This buffer pool is used to keep buffers for
+// reading the config file during eTag header generation
+var bufferPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
 func handleConfig(w http.ResponseWriter, r *http.Request) error {
 	switch r.Method {
 	case http.MethodGet:
 		w.Header().Set("Content-Type", "application/json")
+		hash := etagHasher()
 
-		err := readConfig(r.URL.Path, w)
+		// Read the config into a buffer instead of writing directly to
+		// the response writer, as we want to set the ETag as the header,
+		// not the trailer.
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
+
+		configWriter := io.MultiWriter(buf, hash)
+		err := readConfig(r.URL.Path, configWriter)
 		if err != nil {
 			return APIError{HTTPStatus: http.StatusBadRequest, Err: err}
+		}
+
+		// we could consider setting up a sync.Pool for the summed
+		// hashes to reduce GC pressure.
+		w.Header().Set("Etag", makeEtag(r.URL.Path, hash))
+		_, err = w.Write(buf.Bytes())
+		if err != nil {
+			return APIError{HTTPStatus: http.StatusInternalServerError, Err: err}
 		}
 
 		return nil
@@ -925,6 +1094,9 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 			buf.Reset()
 			defer bufPool.Put(buf)
 
+			const maxConfigSize = 100 * 1024 * 1024 // 100 MB
+			r.Body = http.MaxBytesReader(w, r.Body, maxConfigSize)
+
 			_, err := io.Copy(buf, r.Body)
 			if err != nil {
 				return APIError{
@@ -935,12 +1107,19 @@ func handleConfig(w http.ResponseWriter, r *http.Request) error {
 			body = buf.Bytes()
 		}
 
-		forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
+		forceReload := httpguts.HeaderValuesContainsToken(r.Header["Cache-Control"], "must-revalidate")
 
-		err := changeConfig(r.Method, r.URL.Path, body, forceReload)
+		err := changeConfig(r.Method, r.URL.Path, body, r.Header.Get("If-Match"), forceReload)
 		if err != nil && !errors.Is(err, errSameConfig) {
 			return err
 		}
+
+		// If this request changed the config, clear the last
+		// config info we have stored, if it is different from
+		// the original source.
+		ClearLastConfigIfDifferent(
+			r.Header.Get("Caddy-Config-Source-File"),
+			r.Header.Get("Caddy-Config-Source-Adapter"))
 
 	default:
 		return APIError{
@@ -971,9 +1150,9 @@ func handleConfigID(w http.ResponseWriter, r *http.Request) error {
 	id := parts[2]
 
 	// map the ID to the expanded path
-	currentCfgMu.RLock()
+	rawCfgMu.RLock()
 	expanded, ok := rawCfgIndex[id]
-	defer currentCfgMu.RUnlock()
+	rawCfgMu.RUnlock()
 	if !ok {
 		return APIError{
 			HTTPStatus: http.StatusNotFound,
@@ -996,23 +1175,33 @@ func handleStop(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	if err := notify.NotifyStopping(); err != nil {
-		Log().Error("unable to notify stopping to service manager", zap.Error(err))
-	}
-
-	exitProcess(Log().Named("admin.api"))
+	exitProcess(context.Background(), Log().Named("admin.api"))
 	return nil
+}
+
+func parseCanonicalArrayIndex(idx string) (int, error) {
+	if idx == "" {
+		return 0, fmt.Errorf("empty index")
+	}
+	i, err := strconv.Atoi(idx)
+	if err != nil {
+		return 0, err
+	}
+	if strconv.Itoa(i) != idx {
+		return 0, fmt.Errorf("non-canonical array index")
+	}
+	return i, nil
 }
 
 // unsyncedConfigAccess traverses into the current config and performs
 // the operation at path according to method, using body and out as
 // needed. This is a low-level, unsynchronized function; most callers
 // will want to use changeConfig or readConfig instead. This requires a
-// read or write lock on currentCfgMu, depending on method (GET needs
+// read or write lock on currentCtxMu, depending on method (GET needs
 // only a read lock; all others need a write lock).
 func unsyncedConfigAccess(method, path string, body []byte, out io.Writer) error {
 	var err error
-	var val interface{}
+	var val any
 
 	// if there is a request body, decode it into the
 	// variable that will be set in the config according
@@ -1020,7 +1209,10 @@ func unsyncedConfigAccess(method, path string, body []byte, out io.Writer) error
 	if len(body) > 0 {
 		err = json.Unmarshal(body, &val)
 		if err != nil {
-			return fmt.Errorf("decoding request body: %v", err)
+			if jsonErr, ok := err.(*json.SyntaxError); ok {
+				return fmt.Errorf("decoding request body: %w, at offset %d", jsonErr, jsonErr.Offset)
+			}
+			return fmt.Errorf("decoding request body: %w", err)
 		}
 	}
 
@@ -1049,25 +1241,26 @@ func unsyncedConfigAccess(method, path string, body []byte, out io.Writer) error
 		parts = parts[:len(parts)-1]
 	}
 
-	var ptr interface{} = rawCfg
+	var ptr any = rawCfg
 
 traverseLoop:
 	for i, part := range parts {
 		switch v := ptr.(type) {
-		case map[string]interface{}:
+		case map[string]any:
 			// if the next part enters a slice, and the slice is our destination,
 			// handle it specially (because appending to the slice copies the slice
 			// header, which does not replace the original one like we want)
-			if arr, ok := v[part].([]interface{}); ok && i == len(parts)-2 {
+			if arr, ok := v[part].([]any); ok && i == len(parts)-2 {
 				var idx int
 				if method != http.MethodPost {
 					idxStr := parts[len(parts)-1]
-					idx, err = strconv.Atoi(idxStr)
+					idx, err = parseCanonicalArrayIndex(idxStr)
 					if err != nil {
 						return fmt.Errorf("[%s] invalid array index '%s': %v",
 							path, idxStr, err)
 					}
-					if idx < 0 || idx >= len(arr) {
+
+					if idx < 0 || (method != http.MethodPut && idx >= len(arr)) || idx > len(arr) {
 						return fmt.Errorf("[%s] array index out of bounds: %s", path, idxStr)
 					}
 				}
@@ -1080,7 +1273,7 @@ traverseLoop:
 					}
 				case http.MethodPost:
 					if ellipses {
-						valArray, ok := val.([]interface{})
+						valArray, ok := val.([]any)
 						if !ok {
 							return fmt.Errorf("final element is not an array")
 						}
@@ -1115,9 +1308,9 @@ traverseLoop:
 				case http.MethodPost:
 					// if the part is an existing list, POST appends to
 					// it, otherwise it just sets or creates the value
-					if arr, ok := v[part].([]interface{}); ok {
+					if arr, ok := v[part].([]any); ok {
 						if ellipses {
-							valArray, ok := val.([]interface{})
+							valArray, ok := val.([]any)
 							if !ok {
 								return fmt.Errorf("final element is not an array")
 							}
@@ -1130,15 +1323,27 @@ traverseLoop:
 					}
 				case http.MethodPut:
 					if _, ok := v[part]; ok {
-						return fmt.Errorf("[%s] key already exists: %s", path, part)
+						return APIError{
+							HTTPStatus: http.StatusConflict,
+							Err:        fmt.Errorf("[%s] key already exists: %s", path, part),
+						}
 					}
 					v[part] = val
 				case http.MethodPatch:
 					if _, ok := v[part]; !ok {
-						return fmt.Errorf("[%s] key does not exist: %s", path, part)
+						return APIError{
+							HTTPStatus: http.StatusNotFound,
+							Err:        fmt.Errorf("[%s] key does not exist: %s", path, part),
+						}
 					}
 					v[part] = val
 				case http.MethodDelete:
+					if _, ok := v[part]; !ok {
+						return APIError{
+							HTTPStatus: http.StatusNotFound,
+							Err:        fmt.Errorf("[%s] key does not exist: %s", path, part),
+						}
+					}
 					delete(v, part)
 				default:
 					return fmt.Errorf("unrecognized method %s", method)
@@ -1148,13 +1353,13 @@ traverseLoop:
 				// might not exist yet; that's OK but we need to make them as
 				// we go, while we still have a pointer from the level above
 				if v[part] == nil && method == http.MethodPut {
-					v[part] = make(map[string]interface{})
+					v[part] = make(map[string]any)
 				}
 				ptr = v[part]
 			}
 
-		case []interface{}:
-			partInt, err := strconv.Atoi(part)
+		case []any:
+			partInt, err := parseCanonicalArrayIndex(part)
 			if err != nil {
 				return fmt.Errorf("[/%s] invalid array index '%s': %v",
 					strings.Join(parts[:i+1], "/"), part, err)
@@ -1175,7 +1380,7 @@ traverseLoop:
 
 // RemoveMetaFields removes meta fields like "@id" from a JSON message
 // by using a simple regular expression. (An alternate way to do this
-// would be to delete them from the raw, map[string]interface{}
+// would be to delete them from the raw, map[string]any
 // representation as they are indexed, then iterate the index we made
 // and add them back after encoding as JSON, but this is simpler.)
 func RemoveMetaFields(rawJSON []byte) []byte {
@@ -1212,9 +1417,10 @@ func (f AdminHandlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) erro
 // and client responses. If Message is unset, then
 // Err.Error() will be serialized in its place.
 type APIError struct {
-	HTTPStatus int    `json:"-"`
-	Err        error  `json:"-"`
-	Message    string `json:"error"`
+	HTTPStatus int               `json:"-"`
+	Err        error             `json:"-"`
+	Message    string            `json:"error"`
+	Warnings   []warning.Warning `json:"warnings,omitempty"`
 }
 
 func (e APIError) Error() string {
@@ -1227,7 +1433,10 @@ func (e APIError) Error() string {
 // parseAdminListenAddr extracts a singular listen address from either addr
 // or defaultAddr, returning the network and the address of the listener.
 func parseAdminListenAddr(addr string, defaultAddr string) (NetworkAddress, error) {
-	input := addr
+	input, err := NewReplacer().ReplaceOrErr(addr, true, true)
+	if err != nil {
+		return NetworkAddress{}, fmt.Errorf("replacing listen address: %v", err)
+	}
 	if input == "" {
 		input = defaultAddr
 	}
@@ -1277,7 +1486,7 @@ var (
 // will get deleted before the process gracefully exits.
 func PIDFile(filename string) error {
 	pid := []byte(strconv.Itoa(os.Getpid()) + "\n")
-	err := os.WriteFile(filename, pid, 0600)
+	err := os.WriteFile(filename, pid, 0o600)
 	if err != nil {
 		return err
 	}
@@ -1307,7 +1516,7 @@ const (
 )
 
 var bufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }

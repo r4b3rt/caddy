@@ -20,8 +20,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
@@ -47,22 +48,15 @@ func (adminAPI) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the adminAPI module.
 func (a *adminAPI) Provision(ctx caddy.Context) error {
 	a.ctx = ctx
-	a.log = ctx.Logger(a)
+	a.log = ctx.Logger(a) // TODO: passing in 'a' is a hack until the admin API is officially extensible (see #5032)
 
-	// First check if the PKI app was configured, because
-	// a.ctx.App() has the side effect of instantiating
-	// and provisioning an app even if it wasn't configured.
-	pkiAppConfigured := a.ctx.AppIsConfigured("pki")
-	if !pkiAppConfigured {
-		return nil
+	// Avoid initializing PKI if it wasn't configured.
+	// We intentionally ignore the error since it's not
+	// fatal if the PKI app is not explicitly configured.
+	pkiApp, err := ctx.AppIfConfigured("pki")
+	if err == nil {
+		a.pkiApp = pkiApp.(*PKI)
 	}
-
-	// Load the PKI app, so we can query it for information.
-	appModule, err := a.ctx.App("pki")
-	if err != nil {
-		return err
-	}
-	a.pkiApp = appModule.(*PKI)
 
 	return nil
 }
@@ -169,9 +163,9 @@ func (a *adminAPI) handleCACerts(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	w.Header().Set("Content-Type", "application/pem-certificate-chain")
-	_, err = w.Write(interCert)
+	_, err = w.Write(interCert) //nolint:gosec // false positive... no XSS in a PEM for cryin' out loud
 	if err == nil {
-		_, _ = w.Write(rootCert)
+		_, _ = w.Write(rootCert) //nolint:gosec // false positive... no XSS in a PEM for cryin' out loud
 	}
 
 	return nil
@@ -226,12 +220,17 @@ func (a *adminAPI) getCAFromAPIRequestPath(r *http.Request) (*CA, error) {
 func rootAndIntermediatePEM(ca *CA) (root, inter []byte, err error) {
 	root, err = pemEncodeCert(ca.RootCertificate().Raw)
 	if err != nil {
-		return
+		return root, inter, err
 	}
-	inter, err = pemEncodeCert(ca.IntermediateCertificate().Raw)
-	if err != nil {
-		return
+
+	for _, interCert := range ca.IntermediateCertificateChain() {
+		pemBytes, err := pemEncodeCert(interCert.Raw)
+		if err != nil {
+			return nil, nil, err
+		}
+		inter = append(inter, pemBytes...)
 	}
+
 	return
 }
 

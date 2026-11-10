@@ -15,23 +15,34 @@
 package caddy
 
 import (
+	"bytes"
+	"container/list"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2/internal/systemd"
 )
 
 // NewReplacer returns a new Replacer.
 func NewReplacer() *Replacer {
 	rep := &Replacer{
-		static: make(map[string]interface{}),
+		static:   make(map[string]any),
+		mapMutex: &sync.RWMutex{},
 	}
-	rep.providers = []ReplacerFunc{
-		globalDefaultReplacements,
-		rep.fromStatic,
+	rep.providers = []replacementProvider{
+		globalDefaultReplacementProvider{},
+		fileReplacementProvider{},
+		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
 }
@@ -40,10 +51,11 @@ func NewReplacer() *Replacer {
 // without the global default replacements.
 func NewEmptyReplacer() *Replacer {
 	rep := &Replacer{
-		static: make(map[string]interface{}),
+		static:   make(map[string]any),
+		mapMutex: &sync.RWMutex{},
 	}
-	rep.providers = []ReplacerFunc{
-		rep.fromStatic,
+	rep.providers = []replacementProvider{
+		ReplacerFunc(rep.fromStatic),
 	}
 	return rep
 }
@@ -52,8 +64,25 @@ func NewEmptyReplacer() *Replacer {
 // A default/empty Replacer is not valid;
 // use NewReplacer to make one.
 type Replacer struct {
-	providers []ReplacerFunc
-	static    map[string]interface{}
+	providers []replacementProvider
+	static    map[string]any
+	mapMutex  *sync.RWMutex
+}
+
+// WithoutFile returns a copy of the current Replacer
+// without support for the {file.*} placeholder, which
+// may be unsafe in some contexts.
+//
+// EXPERIMENTAL: Subject to change or removal.
+func (r *Replacer) WithoutFile() *Replacer {
+	rep := &Replacer{static: r.static}
+	for _, v := range r.providers {
+		if _, ok := v.(fileReplacementProvider); ok {
+			continue
+		}
+		rep.providers = append(rep.providers, v)
+	}
+	return rep
 }
 
 // Map adds mapFunc to the list of value providers.
@@ -63,36 +92,54 @@ func (r *Replacer) Map(mapFunc ReplacerFunc) {
 }
 
 // Set sets a custom variable to a static value.
-func (r *Replacer) Set(variable string, value interface{}) {
+func (r *Replacer) Set(variable string, value any) {
+	r.mapMutex.Lock()
 	r.static[variable] = value
+	r.mapMutex.Unlock()
 }
 
 // Get gets a value from the replacer. It returns
 // the value and whether the variable was known.
-func (r *Replacer) Get(variable string) (interface{}, bool) {
+func (r *Replacer) Get(variable string) (any, bool) {
 	for _, mapFunc := range r.providers {
-		if val, ok := mapFunc(variable); ok {
+		if val, ok := mapFunc.replace(variable); ok {
 			return val, true
 		}
 	}
 	return nil, false
 }
 
-// GetString  is the same as Get, but coerces the value to a
-// string representation.
+// GetString is the same as Get, but coerces the value to a
+// string representation as efficiently as possible.
 func (r *Replacer) GetString(variable string) (string, bool) {
 	s, found := r.Get(variable)
-	return toString(s), found
+	return ToString(s), found
 }
 
 // Delete removes a variable with a static value
 // that was created using Set.
 func (r *Replacer) Delete(variable string) {
+	r.mapMutex.Lock()
 	delete(r.static, variable)
+	r.mapMutex.Unlock()
+}
+
+// DeleteByPrefix removes all static variables with
+// keys starting with the given prefix
+func (r *Replacer) DeleteByPrefix(prefix string) {
+	r.mapMutex.Lock()
+	for key := range r.static {
+		if strings.HasPrefix(key, prefix) {
+			delete(r.static, key)
+		}
+	}
+	r.mapMutex.Unlock()
 }
 
 // fromStatic provides values from r.static.
-func (r *Replacer) fromStatic(key string) (interface{}, bool) {
+func (r *Replacer) fromStatic(key string) (any, bool) {
+	r.mapMutex.RLock()
+	defer r.mapMutex.RUnlock()
 	val, ok := r.static[key]
 	return val, ok
 }
@@ -130,8 +177,9 @@ func (r *Replacer) ReplaceFunc(input string, f ReplacementFunc) (string, error) 
 
 func (r *Replacer) replace(input, empty string,
 	treatUnknownAsEmpty, errOnEmpty, errOnUnknown bool,
-	f ReplacementFunc) (string, error) {
-	if !strings.Contains(input, string(phOpen)) {
+	f ReplacementFunc,
+) (string, error) {
+	if !strings.Contains(input, string(phOpen)) && !strings.Contains(input, string(phClose)) {
 		return input, nil
 	}
 
@@ -144,9 +192,14 @@ func (r *Replacer) replace(input, empty string,
 	// iterate the input to find each placeholder
 	var lastWriteCursor int
 
+	// fail fast if too many placeholders are unclosed
+	var unclosedCount int
+
+	// {file.*} lookups hit the disk, so repeats within one call are memoized
+	var files *fileCache
+
 scan:
 	for i := 0; i < len(input); i++ {
-
 		// check for escaped braces
 		if i > 0 && input[i-1] == phEscape && (input[i] == phClose || input[i] == phOpen) {
 			sb.WriteString(input[lastWriteCursor : i-1])
@@ -158,9 +211,17 @@ scan:
 			continue
 		}
 
+		// our iterator is now on an unescaped open brace (start of placeholder)
+
+		// too many unclosed placeholders in absolutely ridiculous input can be extremely slow (issue #4170)
+		if unclosedCount > 100 {
+			return "", fmt.Errorf("too many unclosed placeholders")
+		}
+
 		// find the end of the placeholder
 		end := strings.Index(input[i:], string(phClose)) + i
 		if end < i {
+			unclosedCount++
 			continue
 		}
 
@@ -168,6 +229,7 @@ scan:
 		for end > 0 && end < len(input)-1 && input[end-1] == phEscape {
 			nextEnd := strings.Index(input[end+1:], string(phClose))
 			if nextEnd < 0 {
+				unclosedCount++
 				continue scan
 			}
 			end += nextEnd + 1
@@ -180,7 +242,17 @@ scan:
 		key := input[i+1 : end]
 
 		// try to get a value for this key, handle empty values accordingly
-		val, found := r.Get(key)
+		var val any
+		var found bool
+		isFileKey := strings.HasPrefix(key, filePrefix)
+		if files == nil && isFileKey && r.hasFileProvider() {
+			files = new(fileCache)
+		}
+		if files != nil && isFileKey {
+			val, found = files.get(key, r.Get)
+		} else {
+			val, found = r.Get(key)
+		}
 		if !found {
 			// placeholder is unknown (unrecognized); handle accordingly
 			if errOnUnknown {
@@ -204,7 +276,7 @@ scan:
 		}
 
 		// convert val to a string as efficiently as possible
-		valStr := toString(val)
+		valStr := ToString(val)
 
 		// write the value; if it's empty, either return
 		// an error or write a default value
@@ -230,7 +302,9 @@ scan:
 	return sb.String(), nil
 }
 
-func toString(val interface{}) string {
+// ToString returns val as a string, as efficiently as possible.
+// EXPERIMENTAL: may be changed or removed later.
+func ToString(val any) string {
 	switch v := val.(type) {
 	case nil:
 		return ""
@@ -238,6 +312,8 @@ func toString(val interface{}) string {
 		return v
 	case fmt.Stringer:
 		return v.String()
+	case error:
+		return v.Error()
 	case byte:
 		return string(v)
 	case []byte:
@@ -251,11 +327,11 @@ func toString(val interface{}) string {
 	case int64:
 		return strconv.Itoa(int(v))
 	case uint:
-		return strconv.Itoa(int(v))
+		return strconv.FormatUint(uint64(v), 10)
 	case uint32:
-		return strconv.Itoa(int(v))
+		return strconv.FormatUint(uint64(v), 10)
 	case uint64:
-		return strconv.Itoa(int(v))
+		return strconv.FormatUint(v, 10)
 	case float32:
 		return strconv.FormatFloat(float64(v), 'f', -1, 32)
 	case float64:
@@ -270,18 +346,128 @@ func toString(val interface{}) string {
 	}
 }
 
-// ReplacerFunc is a function that returns a replacement
-// for the given key along with true if the function is able
-// to service that key (even if the value is blank). If the
-// function does not recognize the key, false should be
-// returned.
-type ReplacerFunc func(key string) (interface{}, bool)
+// ReplacerFunc is a function that returns a replacement for the
+// given key along with true if the function is able to service
+// that key (even if the value is blank). If the function does
+// not recognize the key, false should be returned.
+type ReplacerFunc func(key string) (any, bool)
 
-func globalDefaultReplacements(key string) (interface{}, bool) {
+func (f ReplacerFunc) replace(key string) (any, bool) {
+	return f(key)
+}
+
+// replacementProvider is a type that can provide replacements
+// for placeholders. Allows for type assertion to determine
+// which type of provider it is.
+type replacementProvider interface {
+	replace(key string) (any, bool)
+}
+
+// fileReplacementProvider handles {file.*} replacements,
+// reading a file from disk and replacing with its contents.
+type fileReplacementProvider struct{}
+
+func (f fileReplacementProvider) replace(key string) (any, bool) {
+	if !strings.HasPrefix(key, filePrefix) {
+		return nil, false
+	}
+
+	filename := key[len(filePrefix):]
+	maxSize := 1024 * 1024
+	body, err := readFileIntoBuffer(filename, maxSize)
+	if err != nil {
+		wd, _ := os.Getwd()
+		Log().Error("placeholder: failed to read file",
+			zap.String("file", filename),
+			zap.String("working_dir", wd),
+			zap.Error(err))
+		return nil, true
+	}
+	body = bytes.TrimSuffix(body, []byte("\n"))
+	body = bytes.TrimSuffix(body, []byte("\r"))
+	return string(body), true
+}
+
+func (r *Replacer) hasFileProvider() bool {
+	for _, p := range r.providers {
+		if _, ok := p.(fileReplacementProvider); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// fileCache memoizes {file.*} lookups for one replace call. Contents live in a
+// byte-bounded LRU; misses and empty results cost no more than their key.
+type fileCache struct {
+	lru          *list.List
+	entries      map[string]*list.Element
+	size         int
+	emptyResults map[string]any
+}
+
+type fileCacheEntry struct {
+	key  string
+	val  any
+	size int
+}
+
+func (c *fileCache) get(key string, load func(string) (any, bool)) (any, bool) {
+	if el, ok := c.entries[key]; ok {
+		c.lru.MoveToFront(el)
+		return el.Value.(*fileCacheEntry).val, true
+	}
+	if val, ok := c.emptyResults[key]; ok {
+		return val, true
+	}
+
+	val, found := load(key)
+	if !found {
+		return val, found
+	}
+	switch s, isStr := val.(string); {
+	case val == nil || (isStr && s == ""):
+		if c.emptyResults == nil {
+			c.emptyResults = make(map[string]any)
+		}
+		c.emptyResults[key] = val
+	case isStr && len(s) <= maxFileCacheBytes:
+		c.add(key, val, len(s))
+	}
+	return val, found
+}
+
+func (c *fileCache) add(key string, val any, size int) {
+	if c.lru == nil {
+		c.lru = list.New()
+		c.entries = make(map[string]*list.Element)
+	}
+	for c.size+size > maxFileCacheBytes {
+		evicted := c.lru.Remove(c.lru.Back()).(*fileCacheEntry)
+		delete(c.entries, evicted.key)
+		c.size -= evicted.size
+	}
+	c.entries[key] = c.lru.PushFront(&fileCacheEntry{key: key, val: val, size: size})
+	c.size += size
+}
+
+// globalDefaultReplacementProvider handles replacements
+// that can be used in any context, such as system variables,
+// time, or environment variables.
+type globalDefaultReplacementProvider struct{}
+
+func (f globalDefaultReplacementProvider) replace(key string) (any, bool) {
 	// check environment variable
 	const envPrefix = "env."
 	if strings.HasPrefix(key, envPrefix) {
 		return os.Getenv(key[len(envPrefix):]), true
+	}
+	if name, ok := strings.CutPrefix(key, systemdListenPrefix); ok {
+		descriptor, err := systemd.ListenFD(name)
+		if err != nil {
+			return nil, false
+		}
+		return descriptor, true
 	}
 
 	switch key {
@@ -293,10 +479,21 @@ func globalDefaultReplacements(key string) (interface{}, bool) {
 		return string(filepath.Separator), true
 	case "system.os":
 		return runtime.GOOS, true
+	case "system.wd":
+		// OK if there is an error; just return empty string
+		wd, _ := os.Getwd()
+		return wd, true
 	case "system.arch":
 		return runtime.GOARCH, true
 	case "time.now":
 		return nowFunc(), true
+	case "time.now.http":
+		// According to the comment for http.TimeFormat, the timezone must be in UTC
+		// to generate the correct format.
+		// https://github.com/caddyserver/caddy/issues/5773
+		return nowFunc().UTC().Format(http.TimeFormat), true
+	case "time.now.rfc3339":
+		return nowFunc().Format(time.RFC3339), true
 	case "time.now.common_log":
 		return nowFunc().Format("02/Jan/2006:15:04:05 -0700"), true
 	case "time.now.year":
@@ -310,13 +507,27 @@ func globalDefaultReplacements(key string) (interface{}, bool) {
 	return nil, false
 }
 
+// readFileIntoBuffer reads the file at filePath into a size limited buffer.
+func readFileIntoBuffer(filename string, size int) ([]byte, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	// io.LimitReader ensures we never read more than 'size' bytes.
+	// io.ReadAll starts with a small buffer and grows it as needed,
+	// preventing a massive 1MB allocation for small files.
+	return io.ReadAll(io.LimitReader(file, int64(size)))
+}
+
 // ReplacementFunc is a function that is called when a
 // replacement is being performed. It receives the
 // variable (i.e. placeholder name) and the value that
 // will be the replacement, and returns the value that
 // will actually be the replacement, or an error. Note
 // that errors are sometimes ignored by replacers.
-type ReplacementFunc func(variable string, val interface{}) (interface{}, error)
+type ReplacementFunc func(variable string, val any) (any, error)
 
 // nowFunc is a variable so tests can change it
 // in order to obtain a deterministic time.
@@ -326,3 +537,10 @@ var nowFunc = time.Now
 const ReplacerCtxKey CtxKey = "replacer"
 
 const phOpen, phClose, phEscape = '{', '}', '\\'
+
+const filePrefix = "file."
+
+const systemdListenPrefix = "systemd.listen."
+
+// maxFileCacheBytes bounds the memoized file contents to 8 MiB (8,388,608 bytes) per replace call.
+const maxFileCacheBytes = 8 << 20

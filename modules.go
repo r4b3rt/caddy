@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -44,7 +46,7 @@ import (
 // Provisioner, the Provision() method is called. 4) If the
 // module is a Validator, the Validate() method is called.
 // 5) The module will probably be type-asserted from
-// interface{} to some other, more useful interface expected
+// 'any' to some other, more useful interface expected
 // by the host module. For example, HTTP handler modules are
 // type-asserted as caddyhttp.MiddlewareHandler values.
 // 6) When a module's containing Context is canceled, if it is
@@ -172,7 +174,7 @@ func GetModule(name string) (ModuleInfo, error) {
 // GetModuleName returns a module's name (the last label of its ID)
 // from an instance of its value. If the value is not a module, an
 // empty string will be returned.
-func GetModuleName(instance interface{}) string {
+func GetModuleName(instance any) string {
 	var name string
 	if mod, ok := instance.(Module); ok {
 		name = mod.CaddyModule().ID.Name()
@@ -182,7 +184,7 @@ func GetModuleName(instance interface{}) string {
 
 // GetModuleID returns a module's ID from an instance of its value.
 // If the value is not a module, an empty string will be returned.
-func GetModuleID(instance interface{}) string {
+func GetModuleID(instance any) string {
 	var id string
 	if mod, ok := instance.(Module); ok {
 		id = string(mod.CaddyModule().ID)
@@ -259,7 +261,7 @@ func Modules() []string {
 // where raw must be a JSON encoding of a map. It returns that value,
 // along with the result of removing that key from raw.
 func getModuleNameInline(moduleNameKey string, raw json.RawMessage) (string, json.RawMessage, error) {
-	var tmp map[string]interface{}
+	var tmp map[string]any
 	err := json.Unmarshal(raw, &tmp)
 	if err != nil {
 		return "", nil, err
@@ -324,28 +326,34 @@ func ParseStructTag(tag string) (map[string]string, error) {
 		if pair == "" {
 			continue
 		}
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
+		before, after, isCut := strings.Cut(pair, "=")
+		if !isCut {
 			return nil, fmt.Errorf("missing key in '%s' (pair %d)", pair, i)
 		}
-		results[parts[0]] = parts[1]
+		results[before] = after
 	}
 	return results, nil
 }
 
-// strictUnmarshalJSON is like json.Unmarshal but returns an error
+// StrictUnmarshalJSON is like json.Unmarshal but returns an error
 // if any of the fields are unrecognized. Useful when decoding
 // module configurations, where you want to be more sure they're
 // correct.
-func strictUnmarshalJSON(data []byte, v interface{}) error {
+func StrictUnmarshalJSON(data []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	err := dec.Decode(v)
+	if jsonErr, ok := err.(*json.SyntaxError); ok {
+		return fmt.Errorf("%w, at offset %d", jsonErr, jsonErr.Offset)
+	}
+	return err
 }
+
+var JSONRawMessageType = reflect.TypeFor[json.RawMessage]()
 
 // isJSONRawMessage returns true if the type is encoding/json.RawMessage.
 func isJSONRawMessage(typ reflect.Type) bool {
-	return typ.PkgPath() == "encoding/json" && typ.Name() == "RawMessage"
+	return typ == JSONRawMessageType
 }
 
 // isModuleMapType returns true if the type is map[string]json.RawMessage.
@@ -358,6 +366,14 @@ func isModuleMapType(typ reflect.Type) bool {
 	return typ.Kind() == reflect.Map &&
 		typ.Key().Kind() == reflect.String &&
 		isJSONRawMessage(typ.Elem())
+}
+
+// ProxyFuncProducer is implemented by modules which produce a
+// function that returns a URL to use as network proxy. Modules
+// in the namespace `caddy.network_proxy` must implement this
+// interface.
+type ProxyFuncProducer interface {
+	ProxyFunc() func(*http.Request) (*url.URL, error)
 }
 
 var (

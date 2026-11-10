@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -78,7 +79,7 @@ func (h Handler) Validate() error {
 			return err
 		}
 	}
-	if h.Response != nil {
+	if h.Response != nil && h.Response.HeaderOps != nil {
 		err := h.Response.validate()
 		if err != nil {
 			return err
@@ -118,27 +119,72 @@ type HeaderOps struct {
 	// Sets HTTP headers; replaces existing header fields.
 	Set http.Header `json:"set,omitempty"`
 
-	// Names of HTTP header fields to delete.
+	// Names of HTTP header fields to delete. Basic wildcards are supported:
+	//
+	// - Start with `*` for all field names with the given suffix;
+	// - End with `*` for all field names with the given prefix;
+	// - Start and end with `*` for all field names containing a substring.
 	Delete []string `json:"delete,omitempty"`
 
-	// Performs substring replacements of HTTP headers in-situ.
+	// Performs in-situ substring replacements of HTTP headers.
+	// Keys are the field names on which to perform the associated replacements.
+	// If the field name is `*`, the replacements are performed on all header fields.
 	Replace map[string][]Replacement `json:"replace,omitempty"`
 }
 
 // Provision sets up the header operations.
 func (ops *HeaderOps) Provision(_ caddy.Context) error {
+	if ops == nil {
+		return nil // it's possible no ops are configured; fix #6893
+	}
+	if len(ops.Set) > 0 {
+		set := make(http.Header, len(ops.Set))
+		var fields []string
+		for fieldName := range ops.Set {
+			fields = append(fields, fieldName)
+		}
+		sort.Strings(fields)
+		for _, fieldName := range fields {
+			canonical := http.CanonicalHeaderKey(fieldName)
+			set[canonical] = append(set[canonical], ops.Set[fieldName]...)
+		}
+		ops.Set = set
+	}
 	for fieldName, replacements := range ops.Replace {
 		for i, r := range replacements {
-			if r.SearchRegexp != "" {
-				re, err := regexp.Compile(r.SearchRegexp)
-				if err != nil {
-					return fmt.Errorf("replacement %d for header field '%s': %v", i, fieldName, err)
-				}
-				replacements[i].re = re
+			if r.SearchRegexp == "" {
+				continue
 			}
+
+			// Check if it contains placeholders
+			if containsPlaceholders(r.SearchRegexp) {
+				// Contains placeholders, skips precompilation, and recompiles at runtime
+				continue
+			}
+
+			// Does not contain placeholders, safe to precompile
+			re, err := regexp.Compile(r.SearchRegexp)
+			if err != nil {
+				return fmt.Errorf("replacement %d for header field '%s': %v", i, fieldName, err)
+			}
+			replacements[i].re = re
 		}
 	}
 	return nil
+}
+
+// containsPlaceholders checks if the string contains Caddy placeholder syntax {key}
+func containsPlaceholders(s string) bool {
+	_, after, ok := strings.Cut(s, "{")
+	if !ok {
+		return false
+	}
+	closeIdx := strings.Index(after, "}")
+	if closeIdx == -1 {
+		return false
+	}
+	// Make sure there is content between the brackets
+	return closeIdx > 0
 }
 
 func (ops HeaderOps) validate() error {
@@ -178,52 +224,106 @@ type RespHeaderOps struct {
 	Require *caddyhttp.ResponseMatcher `json:"require,omitempty"`
 
 	// If true, header operations will be deferred until
-	// they are written out. Superceded if Require is set.
+	// they are written out. Superseded if Require is set.
 	// Usually you will need to set this to true if any
 	// fields are being deleted.
 	Deferred bool `json:"deferred,omitempty"`
 }
 
 // ApplyTo applies ops to hdr using repl.
-func (ops HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
+func (ops *HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
+	if ops == nil {
+		return
+	}
+	// before manipulating headers in other ways, check if there
+	// is configuration to delete all headers, and do that first
+	// because if a header is to be added, we don't want to delete
+	// it also
+	for _, fieldName := range ops.Delete {
+		fieldName = repl.ReplaceKnown(fieldName, "")
+		if fieldName == "*" {
+			clear(hdr)
+		}
+	}
+
 	// add
 	for fieldName, vals := range ops.Add {
-		fieldName = repl.ReplaceAll(fieldName, "")
+		fieldName = repl.ReplaceKnown(fieldName, "")
 		for _, v := range vals {
-			hdr.Add(fieldName, repl.ReplaceAll(v, ""))
+			hdr.Add(fieldName, repl.ReplaceKnown(v, ""))
 		}
 	}
 
 	// set
 	for fieldName, vals := range ops.Set {
-		fieldName = repl.ReplaceAll(fieldName, "")
-		var newVals []string
+		if expanded := repl.ReplaceKnown(fieldName, ""); expanded != fieldName {
+			fieldName = http.CanonicalHeaderKey(expanded)
+		}
+		newVals := make([]string, len(vals))
 		for i := range vals {
-			// append to new slice so we don't overwrite
-			// the original values in ops.Set
-			newVals = append(newVals, repl.ReplaceAll(vals[i], ""))
+			newVals[i] = repl.ReplaceKnown(vals[i], "")
+		}
+		if fieldName == "Set-Cookie" && len(newVals) > 1 {
+			hdr.Del(fieldName)
+			for _, val := range newVals {
+				hdr.Add(fieldName, val)
+			}
+			continue
 		}
 		hdr.Set(fieldName, strings.Join(newVals, ","))
 	}
 
 	// delete
 	for _, fieldName := range ops.Delete {
-		hdr.Del(repl.ReplaceAll(fieldName, ""))
+		fieldName = strings.ToLower(repl.ReplaceKnown(fieldName, ""))
+		if fieldName == "*" {
+			continue // handled above
+		}
+		switch {
+		case strings.HasPrefix(fieldName, "*") && strings.HasSuffix(fieldName, "*"):
+			for existingField := range hdr {
+				if strings.Contains(strings.ToLower(existingField), fieldName[1:len(fieldName)-1]) {
+					delete(hdr, existingField)
+				}
+			}
+		case strings.HasPrefix(fieldName, "*"):
+			for existingField := range hdr {
+				if strings.HasSuffix(strings.ToLower(existingField), fieldName[1:]) {
+					delete(hdr, existingField)
+				}
+			}
+		case strings.HasSuffix(fieldName, "*"):
+			for existingField := range hdr {
+				if strings.HasPrefix(strings.ToLower(existingField), fieldName[:len(fieldName)-1]) {
+					delete(hdr, existingField)
+				}
+			}
+		default:
+			hdr.Del(fieldName)
+		}
 	}
 
 	// replace
 	for fieldName, replacements := range ops.Replace {
-		fieldName = http.CanonicalHeaderKey(repl.ReplaceAll(fieldName, ""))
+		fieldName = http.CanonicalHeaderKey(repl.ReplaceKnown(fieldName, ""))
 
 		// all fields...
 		if fieldName == "*" {
 			for _, r := range replacements {
-				search := repl.ReplaceAll(r.Search, "")
-				replace := repl.ReplaceAll(r.Replace, "")
+				search := repl.ReplaceKnown(r.Search, "")
+				replace := repl.ReplaceKnown(r.Replace, "")
 				for fieldName, vals := range hdr {
 					for i := range vals {
 						if r.re != nil {
+							// Use precompiled regular expressions
 							hdr[fieldName][i] = r.re.ReplaceAllString(hdr[fieldName][i], replace)
+						} else if r.SearchRegexp != "" {
+							// Runtime compilation of regular expressions
+							searchRegexp := repl.ReplaceKnown(r.SearchRegexp, "")
+							if re, err := regexp.Compile(searchRegexp); err == nil {
+								hdr[fieldName][i] = re.ReplaceAllString(hdr[fieldName][i], replace)
+							}
+							// If compilation fails, skip this replacement
 						} else {
 							hdr[fieldName][i] = strings.ReplaceAll(hdr[fieldName][i], search, replace)
 						}
@@ -235,8 +335,8 @@ func (ops HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
 
 		// ...or only with the named field
 		for _, r := range replacements {
-			search := repl.ReplaceAll(r.Search, "")
-			replace := repl.ReplaceAll(r.Replace, "")
+			search := repl.ReplaceKnown(r.Search, "")
+			replace := repl.ReplaceKnown(r.Replace, "")
 			for hdrFieldName, vals := range hdr {
 				// see issue #4330 for why we don't simply use hdr[fieldName]
 				if http.CanonicalHeaderKey(hdrFieldName) != fieldName {
@@ -245,6 +345,11 @@ func (ops HeaderOps) ApplyTo(hdr http.Header, repl *caddy.Replacer) {
 				for i := range vals {
 					if r.re != nil {
 						hdr[hdrFieldName][i] = r.re.ReplaceAllString(hdr[hdrFieldName][i], replace)
+					} else if r.SearchRegexp != "" {
+						searchRegexp := repl.ReplaceKnown(r.SearchRegexp, "")
+						if re, err := regexp.Compile(searchRegexp); err == nil {
+							hdr[hdrFieldName][i] = re.ReplaceAllString(hdr[hdrFieldName][i], replace)
+						}
 					} else {
 						hdr[hdrFieldName][i] = strings.ReplaceAll(hdr[hdrFieldName][i], search, replace)
 					}
@@ -304,7 +409,10 @@ func (rww *responseWriterWrapper) WriteHeader(status int) {
 	if rww.wroteHeader {
 		return
 	}
-	rww.wroteHeader = true
+	// 1xx responses aren't final; just informational
+	if status < 100 || status > 199 {
+		rww.wroteHeader = true
+	}
 	if rww.require == nil || rww.require.Match(status, rww.ResponseWriterWrapper.Header()) {
 		if rww.headerOps != nil {
 			rww.headerOps.ApplyTo(rww.ResponseWriterWrapper.Header(), rww.replacer)
@@ -324,5 +432,5 @@ func (rww *responseWriterWrapper) Write(d []byte) (int, error) {
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
-	_ caddyhttp.HTTPInterfaces    = (*responseWriterWrapper)(nil)
+	_ http.ResponseWriter         = (*responseWriterWrapper)(nil)
 )

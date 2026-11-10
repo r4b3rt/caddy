@@ -15,19 +15,15 @@
 package caddyhttp
 
 import (
+	"errors"
 	"fmt"
-	weakrand "math/rand"
+	weakrand "math/rand/v2"
 	"path"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
-
-func init() {
-	weakrand.Seed(time.Now().UnixNano())
-}
 
 // Error is a convenient way for a Handler to populate the
 // essential fields of a HandlerError. If err is itself a
@@ -35,7 +31,7 @@ func init() {
 // set will be populated.
 func Error(statusCode int, err error) HandlerError {
 	const idLen = 9
-	if he, ok := err.(HandlerError); ok {
+	if he, ok := errors.AsType[HandlerError](err); ok {
 		if he.ID == "" {
 			he.ID = randString(idLen, true)
 		}
@@ -88,20 +84,22 @@ func (e HandlerError) Unwrap() error { return e.Err }
 // randString returns a string of n random characters.
 // It is not even remotely secure OR a proper distribution.
 // But it's good enough for some things. It excludes certain
-// confusing characters like I, l, 1, 0, O, etc. If sameCase
-// is true, then uppercase letters are excluded.
+// confusing characters.
+// If sameCase is false, then l, I, O, S, 1, and 0 are excluded.
+// If sameCase is true, then uppercase letters are excluded in
+// addition to l, o, 1, and 0.
 func randString(n int, sameCase bool) string {
 	if n <= 0 {
 		return ""
 	}
 	dict := []byte("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRTUVWXY23456789")
 	if sameCase {
-		dict = []byte("abcdefghijkmnpqrstuvwxyz0123456789")
+		dict = []byte("abcdefghijkmnpqrstuvwxyz23456789")
 	}
 	b := make([]byte, n)
 	for i := range b {
 		//nolint:gosec
-		b[i] = dict[weakrand.Int63()%int64(len(dict))]
+		b[i] = dict[weakrand.IntN(len(dict))]
 	}
 	return string(b)
 }

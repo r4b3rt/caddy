@@ -19,96 +19,426 @@
 package reverseproxy
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	weakrand "math/rand/v2"
 	"mime"
+	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"golang.org/x/net/http/httpguts"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-func (h Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response) {
+type extendedConnectReadWriteCloser struct {
+	io.ReadCloser
+	http.ResponseWriter
+}
+
+func (rwc extendedConnectReadWriteCloser) Write(p []byte) (n int, err error) {
+	n, err = rwc.ResponseWriter.Write(p)
+	if err != nil {
+		return 0, err
+	}
+
+	//nolint:bodyclose
+	err = http.NewResponseController(rwc.ResponseWriter).Flush()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// SetWriteDeadline bounds writes to the extended CONNECT stream, so a peer
+// that stopped reading cannot block the close message forever.
+func (rwc extendedConnectReadWriteCloser) SetWriteDeadline(deadline time.Time) error {
+	//nolint:bodyclose
+	return http.NewResponseController(rwc.ResponseWriter).SetWriteDeadline(deadline)
+}
+
+// upstreamConnCtxKey is the context key for the *atomic.Pointer[net.Conn]
+// recording the connection a websocket upgrade's round trip used.
+const upstreamConnCtxKey caddy.CtxKey = "reverse_proxy.upstream_conn"
+
+// upstreamWriteCloser returns where to write the close message to the
+// upstream. The write must be bounded by a deadline, but for HTTP/1
+// upgrades net/http hands the upstream socket back inside a body type that
+// hides its deadline methods and writes straight through to the socket, so
+// the close message goes to the socket recorded during the round trip
+// instead. An HTTP/1 connection is dedicated to this request; HTTP/2 and
+// HTTP/3 share theirs between streams, so their bodies are used as they are.
+func upstreamWriteCloser(req *http.Request, res *http.Response, backConn io.ReadWriteCloser) io.ReadWriteCloser {
+	if res.ProtoMajor != 1 {
+		return backConn
+	}
+	recorded, ok := req.Context().Value(upstreamConnCtxKey).(*atomic.Pointer[net.Conn])
+	if !ok {
+		return backConn
+	}
+	if uc := recorded.Load(); uc != nil {
+		return *uc
+	}
+	return backConn
+}
+
+func (h *Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response, upstreamAddr string) {
+	// Until the tunnel takes ownership, every setup failure must close the
+	// backend body and any hijacked client connection. net/http no longer
+	// owns the client socket after a successful hijack.
+	var conn io.ReadWriteCloser
+	tunnelOwnsConnections := false
+	defer func() {
+		if !tunnelOwnsConnections {
+			res.Body.Close()
+			if conn != nil {
+				conn.Close()
+			}
+		}
+	}()
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
-	// TODO: Update to use "net/http/internal/ascii" once we bumped
-	// the minimum Go version to 1.17.
-	// See https://github.com/golang/go/commit/5c489514bc5e61ad9b5b07bd7d8ec65d66a0512a
-	if reqUpType != resUpType {
-		h.logger.Debug("backend tried to switch to unexpected protocol via Upgrade header",
-			zap.String("backend_upgrade", resUpType),
-			zap.String("requested_upgrade", reqUpType))
+
+	// Taken from https://github.com/golang/go/commit/5c489514bc5e61ad9b5b07bd7d8ec65d66a0512a
+	// We know reqUpType is ASCII, it's checked by the caller.
+	if !asciiIsPrint(resUpType) {
+		if c := logger.Check(zapcore.DebugLevel, "backend tried to switch to invalid protocol"); c != nil {
+			c.Write(zap.String("backend_upgrade", resUpType))
+		}
+		return
+	}
+	if !asciiEqualFold(reqUpType, resUpType) {
+		if c := logger.Check(zapcore.DebugLevel, "backend tried to switch to unexpected protocol via Upgrade header"); c != nil {
+			c.Write(
+				zap.String("backend_upgrade", resUpType),
+				zap.String("requested_upgrade", reqUpType),
+			)
+		}
 		return
 	}
 
-	hj, ok := rw.(http.Hijacker)
-	if !ok {
-		h.logger.Sugar().Errorf("can't switch protocols using non-Hijacker ResponseWriter type %T", rw)
-		return
-	}
 	backConn, ok := res.Body.(io.ReadWriteCloser)
 	if !ok {
-		h.logger.Error("internal error: 101 switching protocols response with non-writable body")
+		logger.Error("internal error: 101 switching protocols response with non-writable body")
 		return
 	}
 
-	// adopted from https://github.com/golang/go/commit/8bcf2834afdf6a1f7937390903a41518715ef6f5
-	backConnCloseCh := make(chan struct{})
-	go func() {
-		// Ensure that the cancelation of a request closes the backend.
-		// See issue https://golang.org/issue/35559.
-		select {
-		case <-req.Context().Done():
-		case <-backConnCloseCh:
-		}
-		backConn.Close()
-	}()
-	defer close(backConnCloseCh)
-
-	logger.Debug("upgrading connection")
-	conn, brw, err := hj.Hijack()
-	if err != nil {
-		h.logger.Error("hijack failed on protocol switch", zap.Error(err))
-		return
-	}
-	defer conn.Close()
-
-	start := time.Now()
-	defer func() {
-		logger.Debug("connection closed", zap.Duration("duration", time.Since(start)))
-	}()
-
+	// write header first, response headers should not be counted in size
+	// like the rest of handler chain.
 	copyHeader(rw.Header(), res.Header)
 
-	res.Header = rw.Header()
-	res.Body = nil // so res.Write only writes the headers; we have res.Body in backConn above
-	if err := res.Write(brw); err != nil {
-		h.logger.Debug("response write", zap.Error(err))
-		return
+	// Capture all h fields needed by the tunnel now, so that the Handler (h)
+	// is not referenced after this function returns (for HTTP/1.1 hijacked
+	// connections the tunnel runs in a detached goroutine).
+	tunnel := h.tunnelTracker
+	bufferSize := h.StreamBufferSize
+	streamTimeout := time.Duration(h.StreamTimeout)
+
+	var (
+		brw      *bufio.ReadWriter
+		detached bool
+	)
+	// websocket over http2 or http3 if extended connect is enabled,
+	// assuming backend doesn't support this, the request will be
+	// modified to http1.1 upgrade
+	// TODO: once we can reliably detect backend support this, it can
+	// be removed for those backends
+	if body, ok := caddyhttp.GetVar(req.Context(), "extended_connect_websocket_body").(io.ReadCloser); ok {
+		// websocket over extended connect can't be detached. rw and req.Body
+		// are only valid while the handler goroutine is running
+		req.Body = body
+		rw.Header().Del("Upgrade")
+		rw.Header().Del("Connection")
+		rw.Header().Del("Sec-WebSocket-Accept")
+		rw.WriteHeader(http.StatusOK)
+
+		if c := logger.Check(zap.DebugLevel, "upgrading connection"); c != nil {
+			c.Write(zap.Int("http_version", req.ProtoMajor))
+		}
+
+		//nolint:bodyclose
+		flushErr := http.NewResponseController(rw).Flush()
+		if flushErr != nil {
+			if c := h.logger.Check(zap.ErrorLevel, "failed to flush extended_connect websocket response"); c != nil {
+				c.Write(zap.Error(flushErr))
+			}
+			return
+		}
+		conn = extendedConnectReadWriteCloser{req.Body, rw}
+		// bufio is not needed, use minimal buffer
+		brw = bufio.NewReadWriter(bufio.NewReaderSize(conn, 1), bufio.NewWriterSize(conn, 1))
+	} else {
+		normalizeWebsocketHeaders(rw.Header())
+		if h.StreamDetached {
+			detached = caddyhttp.DetachResponseWriterAfterHijack(rw, req, true)
+			if !detached {
+				// Some outer writers may have accepted detachment before an
+				// inner writer refused it. Restore attached byte accounting
+				// and keep the handler running for the lifetime of the tunnel.
+				caddyhttp.DetachResponseWriterAfterHijack(rw, req, false)
+				if c := logger.Check(zap.DebugLevel, "detaching connection failed; keeping stream attached"); c != nil {
+					c.Write(zap.String("tip", "check if your response writers have an Unwrap method or if already hijacked"))
+				}
+			}
+		}
+		rw.WriteHeader(res.StatusCode)
+
+		if c := logger.Check(zap.DebugLevel, "upgrading connection"); c != nil {
+			c.Write(zap.Int("http_version", req.ProtoMajor))
+		}
+
+		var hijackErr error
+		//nolint:bodyclose
+		conn, brw, hijackErr = http.NewResponseController(rw).Hijack()
+		if errors.Is(hijackErr, http.ErrNotSupported) {
+			if c := h.logger.Check(zap.ErrorLevel, "can't switch protocols using non-Hijacker ResponseWriter"); c != nil {
+				c.Write(zap.String("type", fmt.Sprintf("%T", rw)))
+			}
+			return
+		}
+
+		if hijackErr != nil {
+			if c := h.logger.Check(zap.ErrorLevel, "hijack failed on protocol switch"); c != nil {
+				c.Write(zap.Error(hijackErr))
+			}
+			return
+		}
 	}
+
 	if err := brw.Flush(); err != nil {
-		h.logger.Debug("response flush", zap.Error(err))
+		if c := logger.Check(zapcore.DebugLevel, "response flush"); c != nil {
+			c.Write(zap.Error(err))
+		}
 		return
 	}
 
-	errc := make(chan error, 1)
-	spc := switchProtocolCopier{user: conn, backend: backConn}
+	// There may be buffered data in the *bufio.Reader
+	// see: https://github.com/caddyserver/caddy/issues/6273
+	if buffered := brw.Reader.Buffered(); buffered > 0 {
+		data, _ := brw.Peek(buffered)
+		_, err := backConn.Write(data)
+		if err != nil {
+			if c := logger.Check(zapcore.DebugLevel, "backConn write failed"); c != nil {
+				c.Write(zap.Error(err))
+			}
+			return
+		}
+	}
+
+	// Register both connections with the tunnel tracker. We also try to
+	// gracefully close connections we recognize as websockets. We need to make
+	// sure the client connection messages (i.e. to upstream) are masked, so we
+	// need to know whether the connection is considered the server or the
+	// client side of the proxy. Note that gracefulClose must not capture h,
+	// since the tunnel may outlive the handler instance.
+	gracefulClose := func(conn io.ReadWriteCloser, isClient bool) func(time.Time) error {
+		if isWebsocket(req) {
+			return func(deadline time.Time) error {
+				return writeCloseControl(conn, isClient, deadline)
+			}
+		}
+		return nil
+	}
+	deleteFrontConn := tunnel.registerConnection(conn, gracefulClose(conn, false), detached, upstreamAddr)
+	deleteBackConn := tunnel.registerConnection(backConn, gracefulClose(upstreamWriteCloser(req, res, backConn), true), detached, upstreamAddr)
+	if h.streamLogsSkipHandshake() {
+		caddyhttp.SetVar(req.Context(), caddyhttp.LogSkipVar, true)
+	}
+	repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.reverse_proxy.upgraded", true)
+	streamUUID, _ := repl.GetString("http.request.uuid")
+	streamFields := makeStreamLogFields(streamUUID)
+	streamLogger := h.streamLoggerForRequest(req)
+	streamLevel := h.streamLogLevel
+	finishMetrics := trackActiveStream(upstreamAddr)
+
+	start := time.Now()
+
+	tunnelOwnsConnections = true
+	if !detached {
+		handleUpgradeTunnel(
+			streamLogger,
+			streamLevel,
+			conn,
+			backConn,
+			deleteFrontConn,
+			deleteBackConn,
+			bufferSize,
+			streamTimeout,
+			start,
+			finishMetrics,
+			streamFields,
+		)
+	} else {
+		// start a new goroutine
+		go handleUpgradeTunnel(
+			streamLogger,
+			streamLevel,
+			conn,
+			backConn,
+			deleteFrontConn,
+			deleteBackConn,
+			bufferSize,
+			streamTimeout,
+			start,
+			finishMetrics,
+			streamFields,
+		)
+	}
+}
+
+// handleUpgradeTunnel returns when transfer is done.
+func handleUpgradeTunnel(
+	streamLogger *zap.Logger,
+	streamLevel zapcore.Level,
+	conn io.ReadWriteCloser,
+	backConn io.ReadWriteCloser,
+	deleteFrontConn func(),
+	deleteBackConn func(),
+	bufferSize int,
+	streamTimeout time.Duration,
+	start time.Time,
+	finishMetrics func(result string, duration time.Duration, toBackend int64, fromBackend int64),
+	streamFields []zap.Field,
+) {
+	defer deleteBackConn()
+	defer deleteFrontConn()
+	var (
+		wg          sync.WaitGroup
+		toBackend   int64
+		fromBackend int64
+		result      string
+	)
+
+	// when a stream timeout is encountered, no error will be read from errc
+	// a buffer size of 2 will allow both the read and write goroutines to
+	// send the error and exit
+	// see: https://github.com/caddyserver/caddy/issues/7418
+	errc := make(chan error, 2)
+	spc := switchProtocolCopier{
+		user:       conn,
+		backend:    backConn,
+		wg:         &wg,
+		bufferSize: bufferSize,
+		sent:       &toBackend,
+		received:   &fromBackend,
+	}
+	wg.Add(2)
+
+	var timeoutc <-chan time.Time
+	if streamTimeout > 0 {
+		timer := time.NewTimer(streamTimeout)
+		defer timer.Stop()
+		timeoutc = timer.C
+	}
+
 	go spc.copyToBackend(errc)
 	go spc.copyFromBackend(errc)
-	<-errc
+	// Wait for both directions to finish. A clean EOF in one direction is a
+	// half-close of that direction only, not the end of the tunnel: the copier
+	// propagates it to the destination with CloseWrite and reports nil, so the
+	// other direction is left open and pending bytes can still drain. Anything
+	// else ends the tunnel: a copy error, a failed CloseWrite, or errCopyDone
+	// when the destination has no write half to close.
+	//
+	// net/http/httputil expresses the same wait as:
+	//
+	//	err := <-errc
+	//	if err == nil {
+	//		err = <-errc
+	//	}
+	//
+	// which cannot be used verbatim here because this handler also selects on the
+	// stream timeout, so the wait is repeated inside that select instead. Both
+	// accept the same sequences; the loop only additionally lets the timeout win
+	// at either wait.
+	//
+	// See https://github.com/caddyserver/caddy/issues/8026, and the same class
+	// fixed upstream in net/http/httputil (https://go.dev/issue/35892).
+	result = "closed"
+copyLoop:
+	for range 2 {
+		select {
+		case err := <-errc:
+			if err != nil {
+				result = classifyStreamResult(err)
+				if c := streamLogger.Check(streamLevel, "streaming error"); c != nil && !errors.Is(err, errCopyDone) {
+					c.Write(zap.Error(err))
+				}
+				break copyLoop
+			}
+		case t := <-timeoutc:
+			result = "timeout"
+			if c := streamLogger.Check(streamLevel, "stream timed out"); c != nil {
+				c.Write(zap.Time("timeout", t))
+			}
+			break copyLoop
+		}
+	}
+
+	// Close both ends to unblock the still-running copy goroutine,
+	// then wait for it so byte counts are final before metrics/logging.
+	conn.Close()
+	backConn.Close()
+	wg.Wait()
+
+	finishMetrics(result, time.Since(start), toBackend, fromBackend)
+	if c := streamLogger.Check(streamLevel, "connection closed"); c != nil {
+		fields := append([]zap.Field{}, streamFields...)
+		fields = append(fields,
+			zap.Duration("duration", time.Since(start)),
+			zap.Int64("bytes_to_backend", toBackend),
+			zap.Int64("bytes_from_backend", fromBackend),
+		)
+		c.Write(fields...)
+	}
+}
+
+func classifyStreamResult(err error) string {
+	if err == nil ||
+		errors.Is(err, errCopyDone) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.Canceled) {
+		return "closed"
+	}
+	return "error"
+}
+
+func makeStreamLogFields(streamUUID string) []zap.Field {
+	fields := make([]zap.Field, 0, 1)
+	if streamUUID != "" {
+		fields = append(fields, zap.String("uuid", streamUUID))
+	}
+	return fields
 }
 
 // flushInterval returns the p.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
-func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Duration {
+func (h Handler) flushInterval(req *http.Request, res *http.Response, incremental bool) time.Duration {
+	// The upstream asked for the response to be forwarded incrementally.
+	// See RFC 10036: https://www.rfc-editor.org/rfc/rfc10036.html
+	if incremental || caddyhttp.IsIncremental(res.Header) {
+		return -1 // negative means immediately
+	}
+
 	resCTHeader := res.Header.Get("Content-Type")
 	resCT, _, err := mime.ParseMediaType(resCTHeader)
 
 	// For Server-Sent Events responses, flush immediately.
 	// The MIME type is defined in https://www.w3.org/TR/eventsource/#text-event-stream
 	if err == nil && resCT == "text/event-stream" {
-		return -1 // negative means immediately
+		return -1
 	}
 
 	// We might have the case of streaming for which Content-Length might be unset.
@@ -116,63 +446,67 @@ func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Durat
 		return -1
 	}
 
-	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
-	if h.isBidirectionalStream(req, res) {
-		return -1
-	}
-
 	return time.Duration(h.FlushInterval)
 }
 
-// isBidirectionalStream returns whether we should work in bi-directional stream mode.
-//
-// See https://github.com/caddyserver/caddy/pull/3620 for discussion of nuances.
-func (h Handler) isBidirectionalStream(req *http.Request, res *http.Response) bool {
-	// We have to check the encoding here; only flush headers with identity encoding.
-	// Non-identity encoding might combine with "encode" directive, and in that case,
-	// if body size larger than enc.MinLength, upper level encode handle might have
-	// Content-Encoding header to write.
-	// (see https://github.com/caddyserver/caddy/issues/3606 for use case)
-	ae := req.Header.Get("Accept-Encoding")
+func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInterval time.Duration, logger *zap.Logger) error {
+	var w io.Writer = dst
 
-	return req.ProtoMajor == 2 &&
-		res.ProtoMajor == 2 &&
-		res.ContentLength == -1 &&
-		(ae == "identity" || ae == "")
-}
-
-func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.Duration) error {
 	if flushInterval != 0 {
-		if wf, ok := dst.(writeFlusher); ok {
-			mlw := &maxLatencyWriter{
-				dst:     wf,
-				latency: flushInterval,
-			}
-			defer mlw.stop()
-
-			// set up initial timer so headers get flushed even if body writes are delayed
-			mlw.flushPending = true
-			mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
-
-			dst = mlw
+		var mlwLogger *zap.Logger
+		if h.VerboseLogs {
+			mlwLogger = logger.Named("max_latency_writer")
+		} else {
+			mlwLogger = zap.NewNop()
 		}
+		mlw := &maxLatencyWriter{
+			dst: dst,
+			//nolint:bodyclose
+			flush:   http.NewResponseController(dst).Flush,
+			latency: flushInterval,
+			logger:  mlwLogger,
+		}
+		defer mlw.stop()
+
+		// set up initial timer so headers get flushed even if body writes are delayed
+		mlw.flushPending = true
+		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
+
+		w = mlw
 	}
 
 	buf := streamingBufPool.Get().(*[]byte)
 	defer streamingBufPool.Put(buf)
-	_, err := h.copyBuffer(dst, src, *buf)
+
+	var copyLogger *zap.Logger
+	if h.VerboseLogs {
+		copyLogger = logger
+	} else {
+		copyLogger = zap.NewNop()
+	}
+
+	_, err := h.copyBuffer(w, src, *buf, copyLogger)
 	return err
 }
 
+// errWritingDownstream wraps errors from writing the response to the client,
+// to tell them apart from errors reading the response from the backend.
+var errWritingDownstream = errors.New("writing")
+
 // copyBuffer returns any write errors or non-EOF read errors, and the amount
 // of bytes written.
-func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, error) {
+func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte, logger *zap.Logger) (int64, error) {
 	if len(buf) == 0 {
 		buf = make([]byte, defaultBufferSize)
 	}
 	var written int64
 	for {
+		logger.Debug("waiting to read from upstream")
 		nr, rerr := src.Read(buf)
+		logger := logger.With(zap.Int("read", nr))
+		if c := logger.Check(zapcore.DebugLevel, "read from upstream"); c != nil {
+			c.Write(zap.Error(rerr))
+		}
 		if rerr != nil && rerr != io.EOF && rerr != context.Canceled {
 			// TODO: this could be useful to know (indeed, it revealed an error in our
 			// fastcgi PoC earlier; but it's this single error report here that necessitates
@@ -181,15 +515,25 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, er
 			// something we need to report to the client, but read errors are a problem on our
 			// end for sure. so we need to decide what we want.)
 			// p.logf("copyBuffer: ReverseProxy read error during body copy: %v", rerr)
-			h.logger.Error("reading from backend", zap.Error(rerr))
+			if c := logger.Check(zapcore.ErrorLevel, "reading from backend"); c != nil {
+				c.Write(zap.Error(rerr))
+			}
 		}
 		if nr > 0 {
+			logger.Debug("writing to downstream")
 			nw, werr := dst.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
 			}
+			if c := logger.Check(zapcore.DebugLevel, "wrote to downstream"); c != nil {
+				c.Write(
+					zap.Int("written", nw),
+					zap.Int64("written_total", written),
+					zap.Error(werr),
+				)
+			}
 			if werr != nil {
-				return written, werr
+				return written, fmt.Errorf("%w: %w", errWritingDownstream, werr)
 			}
 			if nr != nw {
 				return written, io.ErrShortWrite
@@ -197,54 +541,349 @@ func (h Handler) copyBuffer(dst io.Writer, src io.Reader, buf []byte) (int64, er
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
-				rerr = nil
+				return written, nil
 			}
-			return written, rerr
+			return written, fmt.Errorf("reading: %w", rerr)
 		}
 	}
 }
 
-type writeFlusher interface {
-	io.Writer
-	http.Flusher
+// openConnection maps an open connection to an optional function for graceful
+// close and records which upstream address the connection is proxying to.
+// Also tracks whether the connection is detached, which means it should only be
+// closed when the upstream is removed from the config, not on every reload.
+type openConnection struct {
+	conn          io.ReadWriteCloser
+	gracefulClose func(deadline time.Time) error
+	detached      bool
+	upstream      string
+}
+
+// tunnelTracker tracks hijacked/upgraded connections for selective cleanup.
+// This exists to detach the lifecycle of streaming connections from the proxy
+// Handler and config, since we typically want them to survive past config reloads.
+// It also allows for selective connection cleanup based on their attachment status.
+type tunnelTracker struct {
+	connections map[io.ReadWriteCloser]openConnection
+	closeTimer  *time.Timer
+	closeDelay  time.Duration
+	stopped     bool
+	mu          sync.Mutex
+	logger      *zap.Logger
+}
+
+func newTunnelTracker(logger *zap.Logger, closeDelay time.Duration) *tunnelTracker {
+	return &tunnelTracker{
+		connections: make(map[io.ReadWriteCloser]openConnection),
+		closeDelay:  closeDelay,
+		logger:      logger,
+	}
+}
+
+// registerConnection stores conn in the tracking map. The caller must invoke
+// the returned del func when the connection is done.
+func (ts *tunnelTracker) registerConnection(conn io.ReadWriteCloser, gracefulClose func(deadline time.Time) error, detached bool, upstream string) (del func()) {
+	ts.mu.Lock()
+	ts.connections[conn] = openConnection{conn, gracefulClose, detached, upstream}
+	ts.mu.Unlock()
+	return func() {
+		ts.mu.Lock()
+		delete(ts.connections, conn)
+		empty := len(ts.connections) == 0 && ts.stopped
+		if empty {
+			if ts.closeTimer != nil {
+				if ts.closeTimer.Stop() {
+					ts.logger.Debug("stopped streaming connections close timer - all connections are already closed")
+				}
+				ts.closeTimer = nil
+			}
+		}
+		ts.mu.Unlock()
+		if empty {
+			unregisterDetachedTunnelTrackers(ts)
+		}
+	}
+}
+
+// closeAttachedConnections closes all tracked attached connections.
+func (ts *tunnelTracker) closeAttachedConnections() error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	// detached connections are only closed when the upstream is gone from the config
+	return ts.closeConnectionsLocked(time.Now().Add(closeControlWriteTimeout), func(oc openConnection) bool {
+		return !oc.detached
+	})
+}
+
+// closeConnectionsLocked sends a close message to, then closes, every
+// tracked connection that match selects. The caller must hold mu. Every
+// graceful close shares one absolute deadline: the loop is serial and holds
+// the lock, so per-connection timeouts would add up across stalled peers.
+// All close messages are sent before any connection is closed, because
+// closing one side of a tunnel makes its copy loops close the other side,
+// which would lose a close message still waiting to be sent there.
+// The first error is returned.
+func (ts *tunnelTracker) closeConnectionsLocked(deadline time.Time, match func(openConnection) bool) error {
+	var batch []openConnection
+	for _, oc := range ts.connections {
+		if match(oc) {
+			batch = append(batch, oc)
+		}
+	}
+
+	var err error
+	for _, oc := range batch {
+		if oc.gracefulClose != nil {
+			if gracefulErr := oc.gracefulClose(deadline); gracefulErr != nil && err == nil {
+				err = gracefulErr
+			}
+		}
+	}
+	for _, oc := range batch {
+		// The other side of a tunnel may already have closed this one, which
+		// is the expected outcome rather than an error worth logging.
+		if closeErr := oc.conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) && err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+// cleanupAttachedConnections closes upgraded attached connections.
+// Depending on closeDelay it does that either immediately or after a timer.
+func (ts *tunnelTracker) cleanupAttachedConnections() error {
+	ts.mu.Lock()
+	// Mark the tracker stopped before upstream-removal notifications, even
+	// when attached connections will be closed after a delay.
+	ts.stopped = true
+	if len(ts.connections) == 0 {
+		ts.mu.Unlock()
+		unregisterDetachedTunnelTrackers(ts)
+		return nil
+	}
+	if ts.closeDelay == 0 {
+		ts.mu.Unlock()
+		return ts.closeAttachedConnections()
+	}
+
+	defer ts.mu.Unlock()
+	delay := ts.closeDelay
+	ts.closeTimer = time.AfterFunc(delay, func() {
+		if c := ts.logger.Check(zapcore.DebugLevel, "closing streaming connections after delay"); c != nil {
+			c.Write(zap.Duration("delay", delay))
+		}
+		err := ts.closeAttachedConnections()
+		if err != nil {
+			if c := ts.logger.Check(zapcore.ErrorLevel, "failed to close connections after delay"); c != nil {
+				c.Write(
+					zap.Error(err),
+					zap.Duration("delay", delay),
+				)
+			}
+		}
+	})
+	return nil
+}
+
+// writeCloseControl sends a best-effort Close control message to the given
+// WebSocket connection. Thanks to @pascaldekloe who provided inspiration
+// from his simple implementation of this I was able to learn from at:
+// github.com/pascaldekloe/websocket. Further work for handling masking
+// taken from github.com/gorilla/websocket.
+//
+// The write must finish by deadline: a peer that stopped reading leaves the
+// tunnel's copy goroutine stuck writing, and the close message would wait
+// behind it forever while the caller holds the tunnel tracker lock. The
+// connection is closed right after, so the deadline needs no reset.
+// Connections that cannot set a write deadline are skipped instead.
+func writeCloseControl(conn io.Writer, isClient bool, deadline time.Time) error {
+	dc, ok := conn.(interface{ SetWriteDeadline(time.Time) error })
+	if !ok {
+		return nil
+	}
+	if err := dc.SetWriteDeadline(deadline); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			return nil
+		}
+		return err
+	}
+
+	// Sources:
+	// https://github.com/pascaldekloe/websocket/blob/32050af67a5d/websocket.go#L119
+	// https://github.com/gorilla/websocket/blob/v1.5.0/conn.go#L413
+
+	// For now, we're not using a reason. We might later, though.
+	// The code handling the reason is left in
+	var reason string // max 123 bytes (control frame payload limit is 125; status code takes 2)
+
+	const closeMessage = 8
+	const finalBit = 1 << 7 // Frame header byte 0 bits from Section 5.2 of RFC 6455
+	const maskBit = 1 << 7  // Frame header byte 1 bits from Section 5.2 of RFC 6455
+	const goingAwayUpper uint8 = 1001 >> 8
+	const goingAwayLower uint8 = 1001 & 0xff
+
+	b0 := byte(closeMessage) | finalBit
+	b1 := byte(len(reason) + 2)
+	if isClient {
+		b1 |= maskBit
+	}
+
+	buf := make([]byte, 0, 127)
+	buf = append(buf, b0, b1)
+	msgLength := 4 + len(reason)
+
+	// Both branches below append the "going away" code and reason
+	appendMessage := func(buf []byte) []byte {
+		buf = append(buf, goingAwayUpper, goingAwayLower)
+		buf = append(buf, []byte(reason)...)
+		return buf
+	}
+
+	// When we're the client, we need to mask the message as per
+	// https://www.rfc-editor.org/rfc/rfc6455#section-5.3
+	if isClient {
+		key := newMaskKey()
+		buf = append(buf, key[:]...)
+		msgLength += len(key)
+		buf = appendMessage(buf)
+		maskBytes(key, 0, buf[2+len(key):])
+	} else {
+		buf = appendMessage(buf)
+	}
+
+	// simply best-effort, but return error for logging purposes
+	// TODO: we might need to ensure we are the exclusive writer by this point (io.Copy is stopped)?
+	_, err := conn.Write(buf[:msgLength])
+	return err
+}
+
+// closeControlWriteTimeout is how long one batch of graceful closes waits
+// for peers to accept their close messages before giving up on them. It is
+// a variable so tests can shorten it.
+var closeControlWriteTimeout = 5 * time.Second
+
+// Copied from https://github.com/gorilla/websocket/blob/v1.5.0/mask.go
+func maskBytes(key [4]byte, pos int, b []byte) int {
+	// Mask one byte at a time for small buffers.
+	if len(b) < 2*wordSize {
+		for i := range b {
+			b[i] ^= key[pos&3]
+			pos++
+		}
+		return pos & 3
+	}
+
+	// Mask one byte at a time to word boundary.
+	if n := int(uintptr(unsafe.Pointer(&b[0]))) % wordSize; n != 0 {
+		n = wordSize - n
+		for i := range b[:n] {
+			b[i] ^= key[pos&3]
+			pos++
+		}
+		b = b[n:]
+	}
+
+	// Create aligned word size key.
+	var k [wordSize]byte
+	for i := range k {
+		k[i] = key[(pos+i)&3] // nolint:gosec // false positive, impossible to be out of bounds; see: https://github.com/securego/gosec/issues/1525
+	}
+	kw := *(*uintptr)(unsafe.Pointer(&k))
+
+	// Mask one word at a time.
+	n := (len(b) / wordSize) * wordSize
+	for i := 0; i < n; i += wordSize {
+		*(*uintptr)(unsafe.Add(unsafe.Pointer(&b[0]), i)) ^= kw
+	}
+
+	// Mask one byte at a time for remaining bytes.
+	b = b[n:]
+	for i := range b {
+		b[i] ^= key[pos&3]
+		pos++
+	}
+
+	return pos & 3
+}
+
+// Copied from https://github.com/gorilla/websocket/blob/v1.5.0/conn.go#L184
+func newMaskKey() [4]byte {
+	n := weakrand.Uint32()
+	return [4]byte{byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24)}
+}
+
+// isWebsocket returns true if r looks to be an upgrade request for WebSockets.
+// It is a fairly naive check.
+func isWebsocket(r *http.Request) bool {
+	return httpguts.HeaderValuesContainsToken(r.Header["Connection"], "upgrade") &&
+		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+}
+
+// closeConnectionsForUpstream closes detached connections to the given
+// upstream on stopped trackers. Attached connections keep their close delay.
+// The deadline is shared so one upstream removal is bounded across every
+// tracker it notifies.
+func (ts *tunnelTracker) closeConnectionsForUpstream(addr string, deadline time.Time) error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if !ts.stopped {
+		return nil
+	}
+	return ts.closeConnectionsLocked(deadline, func(oc openConnection) bool {
+		return oc.detached && oc.upstream == addr
+	})
 }
 
 type maxLatencyWriter struct {
-	dst     writeFlusher
+	dst     io.Writer
+	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
 	mu           sync.Mutex // protects t, flushPending, and dst.Flush
 	t            *time.Timer
 	flushPending bool
+	logger       *zap.Logger
 }
 
 func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n, err = m.dst.Write(p)
+	if c := m.logger.Check(zapcore.DebugLevel, "wrote bytes"); c != nil {
+		c.Write(zap.Int("n", n), zap.Error(err))
+	}
 	if m.latency < 0 {
-		m.dst.Flush()
-		return
+		m.logger.Debug("flushing immediately")
+		//nolint:errcheck
+		m.flush()
+		return n, err
 	}
 	if m.flushPending {
-		return
+		m.logger.Debug("delayed flush already pending")
+		return n, err
 	}
 	if m.t == nil {
 		m.t = time.AfterFunc(m.latency, m.delayedFlush)
 	} else {
 		m.t.Reset(m.latency)
 	}
+	if c := m.logger.Check(zapcore.DebugLevel, "timer set for delayed flush"); c != nil {
+		c.Write(zap.Duration("duration", m.latency))
+	}
 	m.flushPending = true
-	return
+	return n, err
 }
 
 func (m *maxLatencyWriter) delayedFlush() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.flushPending { // if stop was called but AfterFunc already started this goroutine
+		m.logger.Debug("delayed flush is not pending")
 		return
 	}
-	m.dst.Flush()
+	m.logger.Debug("delayed flush")
+	//nolint:errcheck
+	m.flush()
 	m.flushPending = false
 }
 
@@ -260,21 +899,67 @@ func (m *maxLatencyWriter) stop() {
 // switchProtocolCopier exists so goroutines proxying data back and
 // forth have nice names in stacks.
 type switchProtocolCopier struct {
-	user, backend io.ReadWriter
+	user, backend io.ReadWriteCloser
+	wg            *sync.WaitGroup
+	bufferSize    int
+	// sent and received accumulate byte counts for each direction.
+	// They are written before wg.Done() and read after wg.Wait(), so no
+	// additional synchronization is needed beyond the WaitGroup barrier.
+	sent     *int64 // bytes copied to backend; must be non-nil
+	received *int64 // bytes copied from backend; must be non-nil
 }
 
+// errCopyDone is reported by a direction that ended at a clean EOF on a
+// connection whose write half cannot be closed, so the end of that direction
+// could not be propagated to the peer.
+var errCopyDone = errors.New("hijacked connection copy complete")
+
 func (c switchProtocolCopier) copyFromBackend(errc chan<- error) {
-	_, err := io.Copy(c.user, c.backend)
-	errc <- err
+	defer c.wg.Done()
+	n, err := io.CopyBuffer(c.user, c.backend, c.buffer())
+	*c.received = n
+	if err != nil {
+		errc <- err
+		return
+	}
+
+	// backend conn has reached EOF so propagate close write to user conn
+	if wc, ok := c.user.(interface{ CloseWrite() error }); ok {
+		errc <- wc.CloseWrite()
+		return
+	}
+
+	errc <- errCopyDone
 }
 
 func (c switchProtocolCopier) copyToBackend(errc chan<- error) {
-	_, err := io.Copy(c.backend, c.user)
-	errc <- err
+	defer c.wg.Done()
+	n, err := io.CopyBuffer(c.backend, c.user, c.buffer())
+	*c.sent = n
+	if err != nil {
+		errc <- err
+		return
+	}
+
+	// user conn has reached EOF so propagate close write to backend conn
+	if wc, ok := c.backend.(interface{ CloseWrite() error }); ok {
+		errc <- wc.CloseWrite()
+		return
+	}
+
+	errc <- errCopyDone
+}
+
+func (c switchProtocolCopier) buffer() []byte {
+	size := c.bufferSize
+	if size <= 0 {
+		size = defaultBufferSize
+	}
+	return make([]byte, size)
 }
 
 var streamingBufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		// The Pool's New function should generally only return pointer
 		// types, since a pointer can be put into the return interface
 		// value without an allocation
@@ -284,4 +969,7 @@ var streamingBufPool = sync.Pool{
 	},
 }
 
-const defaultBufferSize = 32 * 1024
+const (
+	defaultBufferSize = 32 * 1024
+	wordSize          = int(unsafe.Sizeof(uintptr(0)))
+)

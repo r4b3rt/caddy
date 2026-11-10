@@ -15,9 +15,27 @@
 package caddy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"testing"
 )
+
+func TestContextWithValuePreservesMetricsRegistry(t *testing.T) {
+	ctx, cancel := NewContext(Context{Context: context.Background()})
+	t.Cleanup(cancel)
+
+	reg := ctx.GetMetricsRegistry()
+	if reg == nil {
+		t.Fatal("expected a metrics registry on the base context")
+	}
+
+	type testKey struct{}
+	derived := ctx.WithValue(testKey{}, "value")
+	if got := derived.GetMetricsRegistry(); got != reg {
+		t.Fatalf("WithValue must preserve the metrics registry: got %p, want %p", got, reg)
+	}
+}
 
 func ExampleContext_LoadModule() {
 	// this whole first part is just setting up for the example;
@@ -71,13 +89,13 @@ func ExampleContext_LoadModule_array() {
 		},
 	}
 
-	// since our input is []json.RawMessage, the output will be []interface{}
+	// since our input is []json.RawMessage, the output will be []any
 	mods, err := ctx.LoadModule(myStruct, "GuestModulesRaw")
 	if err != nil {
 		// you'd want to actually handle the error here
 		// return fmt.Errorf("loading guest modules: %v", err)
 	}
-	for _, mod := range mods.([]interface{}) {
+	for _, mod := range mods.([]any) {
 		myStruct.guestModules = append(myStruct.guestModules, mod.(io.Writer))
 	}
 
@@ -104,13 +122,13 @@ func ExampleContext_LoadModule_map() {
 		},
 	}
 
-	// since our input is map[string]json.RawMessage, the output will be map[string]interface{}
+	// since our input is map[string]json.RawMessage, the output will be map[string]any
 	mods, err := ctx.LoadModule(myStruct, "GuestModulesRaw")
 	if err != nil {
 		// you'd want to actually handle the error here
 		// return fmt.Errorf("loading guest modules: %v", err)
 	}
-	for modName, mod := range mods.(map[string]interface{}) {
+	for modName, mod := range mods.(map[string]any) {
 		myStruct.guestModules[modName] = mod.(io.Writer)
 	}
 

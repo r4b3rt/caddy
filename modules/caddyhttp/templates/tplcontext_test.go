@@ -17,9 +17,11 @@ package templates
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,11 +30,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-type handle struct {
-}
+type handle struct{}
 
 func (h *handle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Accept-Encoding") == "identity" {
@@ -177,11 +179,10 @@ func TestImport(t *testing.T) {
 		} else if !templateWasDefined && actual != "" {
 			// template should be defined, return value should be an empty string
 			t.Errorf("Test %d: Expected template %s to be define but got %s", i, test.expect, tplContext.tpl.DefinedTemplates())
-
 		}
 
 		if absFilePath != "" {
-			if err := os.Remove(absFilePath); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(absFilePath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("Test %d: Expected no error removing temporary test file, got: %v", i, err)
 			}
 		}
@@ -221,21 +222,21 @@ func TestNestedInclude(t *testing.T) {
 		// create files and for test case
 		if test.parentFile != "" {
 			absFilePath = filepath.Join(fmt.Sprintf("%s", context.Root), test.parentFile)
-			if err := ioutil.WriteFile(absFilePath, []byte(test.parent), os.ModePerm); err != nil {
+			if err := os.WriteFile(absFilePath, []byte(test.parent), os.ModePerm); err != nil {
 				os.Remove(absFilePath)
 				t.Fatalf("Test %d: Expected no error creating file, got: '%s'", i, err.Error())
 			}
 		}
 		if test.childFile != "" {
 			absFilePath0 = filepath.Join(fmt.Sprintf("%s", context.Root), test.childFile)
-			if err := ioutil.WriteFile(absFilePath0, []byte(test.child), os.ModePerm); err != nil {
+			if err := os.WriteFile(absFilePath0, []byte(test.child), os.ModePerm); err != nil {
 				os.Remove(absFilePath0)
 				t.Fatalf("Test %d: Expected no error creating file, got: '%s'", i, err.Error())
 			}
 		}
 		if test.child2File != "" {
 			absFilePath1 = filepath.Join(fmt.Sprintf("%s", context.Root), test.child2File)
-			if err := ioutil.WriteFile(absFilePath1, []byte(test.child2), os.ModePerm); err != nil {
+			if err := os.WriteFile(absFilePath1, []byte(test.child2), os.ModePerm); err != nil {
 				os.Remove(absFilePath0)
 				t.Fatalf("Test %d: Expected no error creating file, got: '%s'", i, err.Error())
 			}
@@ -256,21 +257,20 @@ func TestNestedInclude(t *testing.T) {
 		} else if buf.String() != test.expect {
 			//
 			t.Errorf("Test %d: Expected '%s' but got '%s'", i, test.expect, buf.String())
-
 		}
 
 		if absFilePath != "" {
-			if err := os.Remove(absFilePath); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(absFilePath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("Test %d: Expected no error removing temporary test file, got: %v", i, err)
 			}
 		}
 		if absFilePath0 != "" {
-			if err := os.Remove(absFilePath0); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(absFilePath0); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("Test %d: Expected no error removing temporary test file, got: %v", i, err)
 			}
 		}
 		if absFilePath1 != "" {
-			if err := os.Remove(absFilePath1); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(absFilePath1); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("Test %d: Expected no error removing temporary test file, got: %v", i, err)
 			}
 		}
@@ -343,11 +343,10 @@ func TestInclude(t *testing.T) {
 			t.Errorf("Test %d: Expected error but had none", i)
 		} else if actual != test.expect {
 			t.Errorf("Test %d: Expected %s but got %s", i, test.expect, actual)
-
 		}
 
 		if absFilePath != "" {
-			if err := os.Remove(absFilePath); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(absFilePath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("Test %d: Expected no error removing temporary test file, got: %v", i, err)
 			}
 		}
@@ -422,14 +421,44 @@ func TestStripHTML(t *testing.T) {
 			expect: `h1`,
 		},
 		{
-			// tags not closed
+			// unclosed tag — trailing text must be stripped, not emitted
 			input:  `<h1`,
-			expect: `<h1`,
+			expect: ``,
 		},
 		{
-			// false start
+			// false start — second '<' increments depth, single '>' only closes one level
 			input:  `<h1<b>hi`,
-			expect: `<h1hi`,
+			expect: ``,
+		},
+		{
+			// XSS bypass via double opening bracket
+			input:  `<<>img src=x onerror=alert('XSS')>`,
+			expect: ``,
+		},
+		{
+			// stacked angle brackets (PHP strip_tags parity)
+			input:  `<<<<<>>>>><b>hello</b>`,
+			expect: `hello`,
+		},
+		{
+			// unclosed tag strips trailing text
+			input:  `hello <world`,
+			expect: `hello `,
+		},
+		{
+			// '>' inside double-quoted attribute must not close tag early
+			input:  `<a href="foo>bar">text</a>`,
+			expect: `text`,
+		},
+		{
+			// '>' inside single-quoted attribute must not close tag early
+			input:  `<a href='foo>bar'>text</a>`,
+			expect: `text`,
+		},
+		{
+			// stray '>' with no opening '<' is preserved
+			input:  `stray > bracket`,
+			expect: `stray > bracket`,
 		},
 	} {
 		actual := tplContext.funcStripHTML(test.input)
@@ -461,7 +490,7 @@ func TestFileListing(t *testing.T) {
 			fileNames: nil,
 			inputBase: "doesNotExist",
 			shouldErr: true,
-			verifyErr: os.IsNotExist,
+			verifyErr: func(err error) bool { return errors.Is(err, fs.ErrNotExist) },
 		},
 		{
 			// directory and files exist, but path to a file
@@ -477,7 +506,7 @@ func TestFileListing(t *testing.T) {
 			fileNames: nil,
 			inputBase: filepath.Join("..", "..", "..", "..", "..", "etc"),
 			shouldErr: true,
-			verifyErr: os.IsNotExist,
+			verifyErr: func(err error) bool { return errors.Is(err, fs.ErrNotExist) },
 		},
 	} {
 		tplContext := getContextOrFail(t)
@@ -526,7 +555,7 @@ func TestFileListing(t *testing.T) {
 		}
 
 		if dirPath != "" {
-			if err := os.RemoveAll(dirPath); err != nil && !os.IsNotExist(err) {
+			if err := os.RemoveAll(dirPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("Test %d: Expected no error removing temporary test directory, got: %v", i, err)
 			}
 		}
@@ -577,6 +606,17 @@ yeah`,
 			body:   "\n### Test\n...\nyeah",
 		},
 		{
+			// yaml closed with dots, with a '---' rule later in the body
+			input: `---
+title: Welcome
+...
+### Test
+---
+yeah`,
+			expect: `Welcome`,
+			body:   "\n### Test\n---\nyeah",
+		},
+		{
 			// toml
 			input: `+++
 title = "Welcome"
@@ -603,7 +643,55 @@ title = "Welcome"
 			t.Errorf("Test %d: Expected body %s, found %s. Input was SplitFrontMatter(%s)", i, test.body, result.Body, test.input)
 		}
 	}
+}
 
+func TestHumanize(t *testing.T) {
+	tplContext := getContextOrFail(t)
+	for i, test := range []struct {
+		format    string
+		inputData string
+		expect    string
+		errorCase bool
+		verifyErr func(actual_string, substring string) bool
+	}{
+		{
+			format:    "size",
+			inputData: "2048000",
+			expect:    "2.0 MB",
+			errorCase: false,
+			verifyErr: strings.Contains,
+		},
+		{
+			format:    "time",
+			inputData: "Fri, 05 May 2022 15:04:05 +0200",
+			expect:    "ago",
+			errorCase: false,
+			verifyErr: strings.HasSuffix,
+		},
+		{
+			format:    "time:2006-Jan-02",
+			inputData: "2022-May-05",
+			expect:    "ago",
+			errorCase: false,
+			verifyErr: strings.HasSuffix,
+		},
+		{
+			format:    "time",
+			inputData: "Fri, 05 May 2022 15:04:05 GMT+0200",
+			expect:    "error:",
+			errorCase: true,
+			verifyErr: strings.HasPrefix,
+		},
+	} {
+		if actual, err := tplContext.funcHumanize(test.format, test.inputData); !test.verifyErr(actual, test.expect) {
+			if !test.errorCase {
+				t.Errorf("Test %d: Expected '%s' but got '%s'", i, test.expect, actual)
+				if err != nil {
+					t.Errorf("Test %d: error: %s", i, err.Error())
+				}
+			}
+		}
+	}
 }
 
 func getContextOrFail(t *testing.T) TemplateContext {
@@ -632,4 +720,53 @@ func initTestContext() (TemplateContext, error) {
 		Req:        request,
 		RespHeader: WrappedHeader{make(http.Header)},
 	}, nil
+}
+// TestFuncPlaceholderPropagatesOnlyBodyLimitMarker verifies that the template
+// placeholder function aborts only on the request-body limit marker and keeps
+// rendering unrelated errors as text, exactly like before.
+func TestFuncPlaceholderPropagatesOnlyBodyLimitMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		value     any
+		wantAbort bool
+	}{
+		{name: "body limit marker aborts the template", value: caddyhttp.RequestBodyLimitError{Err: &http.MaxBytesError{Limit: 10}}, wantAbort: true},
+		{name: "unrelated handler error renders as text like before", value: caddyhttp.HandlerError{Err: errors.New("boom"), StatusCode: http.StatusInternalServerError}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repl := caddy.NewReplacer()
+			repl.Map(func(name string) (any, bool) {
+				if name == "http.request.body" {
+					return tc.value, true
+				}
+				return nil, false
+			})
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+			c := TemplateContext{Req: req}
+
+			out, err := c.funcPlaceholder("http.request.body")
+
+			if tc.wantAbort {
+				var marker caddyhttp.RequestBodyLimitError
+				if err == nil || !errors.As(err, &marker) {
+					t.Fatalf("expected the body limit marker but got %q, %v", out, err)
+				}
+				handlerErr, ok := err.(caddyhttp.HandlerError)
+				if !ok || handlerErr.StatusCode != http.StatusRequestEntityTooLarge {
+					t.Errorf("expected a 413 handler error carrying the marker but got %v", err)
+				}
+				if out != "" {
+					t.Errorf("expected an empty string on abort but got %q", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unrelated handler errors must render as text like before but got %v", err)
+			}
+			if !strings.Contains(out, "boom") {
+				t.Errorf("expected the error text in the output but got %q", out)
+			}
+		})
+	}
 }

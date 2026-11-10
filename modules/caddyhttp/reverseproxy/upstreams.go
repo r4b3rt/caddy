@@ -2,21 +2,27 @@ package reverseproxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	weakrand "math/rand"
+	weakrand "math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
-	"sync"
+	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/internal/network"
 )
 
 func init() {
 	caddy.RegisterModule(SRVUpstreams{})
 	caddy.RegisterModule(AUpstreams{})
+	caddy.RegisterModule(MultiUpstreams{})
 }
 
 // SRVUpstreams provides upstreams from SRV lookups.
@@ -46,6 +52,13 @@ type SRVUpstreams struct {
 	// Results are cached between lookups. Default: 1m
 	Refresh caddy.Duration `json:"refresh,omitempty"`
 
+	// If > 0 and there is an error with the lookup,
+	// continue to use the cached results for up to
+	// this long before trying again, (even though they
+	// are stale) instead of returning an error to the
+	// client. Default: 0s.
+	GracePeriod caddy.Duration `json:"grace_period,omitempty"`
+
 	// Configures the DNS resolver used to resolve the
 	// SRV address to SRV records.
 	Resolver *UpstreamResolver `json:"resolver,omitempty"`
@@ -59,7 +72,17 @@ type SRVUpstreams struct {
 	// A negative value disables this.
 	FallbackDelay caddy.Duration `json:"dial_fallback_delay,omitempty"`
 
+	// Specific network to dial when connecting to the upstream(s)
+	// provided by SRV records upstream. See Go's net package for
+	// accepted values. For example, to restrict to IPv4, use "tcp4".
+	DialNetwork string `json:"dial_network,omitempty"`
+
 	resolver *net.Resolver
+
+	// resolverKey identifies resolver for the shared DNS cache, so two SRV
+	// sources that look up the same record with different resolvers do not
+	// share a cache entry. Empty for the default resolver.
+	resolverKey string
 
 	logger *zap.Logger
 }
@@ -72,13 +95,8 @@ func (SRVUpstreams) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// String returns the RFC 2782 representation of the SRV domain.
-func (su SRVUpstreams) String() string {
-	return fmt.Sprintf("_%s._%s.%s", su.Service, su.Proto, su.Name)
-}
-
 func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
-	su.logger = ctx.Logger(su)
+	su.logger = ctx.Logger()
 	if su.Refresh == 0 {
 		su.Refresh = caddy.Duration(time.Minute)
 	}
@@ -96,7 +114,7 @@ func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				//nolint:gosec
-				addr := su.Resolver.netAddrs[weakrand.Intn(len(su.Resolver.netAddrs))]
+				addr := su.Resolver.netAddrs[weakrand.IntN(len(su.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
 			},
 		}
@@ -104,97 +122,89 @@ func (su *SRVUpstreams) Provision(ctx caddy.Context) error {
 	if su.resolver == nil {
 		su.resolver = net.DefaultResolver
 	}
+	su.resolverKey = resolverCacheKey(su.Resolver)
 
 	return nil
 }
 
+func (su *SRVUpstreams) ResetCache(r *http.Request) error {
+	if r == nil {
+		network.ResetAllSRV()
+		return nil
+	}
+	_, service, proto, name := su.expandedAddr(r)
+	network.ResetSRV(su.resolverKey, service, proto, name)
+	return nil
+}
+
 func (su SRVUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
-	suStr := su.String()
+	_, service, proto, name := su.expandedAddr(r)
 
-	// first, use a cheap read-lock to return a cached result quickly
-	srvsMu.RLock()
-	cached := srvs[suStr]
-	srvsMu.RUnlock()
-	if cached.isFresh() {
-		return cached.upstreams, nil
-	}
-
-	// otherwise, obtain a write-lock to update the cached value
-	srvsMu.Lock()
-	defer srvsMu.Unlock()
-
-	// check to see if it's still stale, since we're now in a different
-	// lock from when we first checked freshness; another goroutine might
-	// have refreshed it in the meantime before we re-obtained our lock
-	cached = srvs[suStr]
-	if cached.isFresh() {
-		return cached.upstreams, nil
-	}
-
-	// prepare parameters and perform the SRV lookup
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	service := repl.ReplaceAll(su.Service, "")
-	proto := repl.ReplaceAll(su.Proto, "")
-	name := repl.ReplaceAll(su.Name, "")
-
-	su.logger.Debug("refreshing SRV upstreams",
-		zap.String("service", service),
-		zap.String("proto", proto),
-		zap.String("name", name))
-
-	_, records, err := su.resolver.LookupSRV(r.Context(), service, proto, name)
+	targets, err := network.SRV(r.Context(), su.resolver.LookupSRV,
+		su.resolverKey, service, proto, name,
+		time.Duration(su.Refresh), time.Duration(su.GracePeriod), su.logger)
 	if err != nil {
-		// From LookupSRV docs: "If the response contains invalid names, those records are filtered
-		// out and an error will be returned alongside the the remaining results, if any." Thus, we
-		// only return an error if no records were also returned.
-		if len(records) == 0 {
-			return nil, err
-		}
-		su.logger.Warn("SRV records filtered", zap.Error(err))
+		return nil, err
 	}
 
-	upstreams := make([]*Upstream, len(records))
-	for i, rec := range records {
-		su.logger.Debug("discovered SRV record",
-			zap.String("target", rec.Target),
-			zap.Uint16("port", rec.Port),
-			zap.Uint16("priority", rec.Priority),
-			zap.Uint16("weight", rec.Weight))
-		addr := net.JoinHostPort(rec.Target, strconv.Itoa(int(rec.Port)))
+	upstreams := make([]*Upstream, len(targets))
+	for i, t := range targets {
+		addr := net.JoinHostPort(t.Host, t.Port)
+		if su.DialNetwork != "" {
+			addr = su.DialNetwork + "/" + addr
+		}
 		upstreams[i] = &Upstream{Dial: addr}
 	}
-
-	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
-	if cached.freshness.IsZero() && len(srvs) >= 100 {
-		for randomKey := range srvs {
-			delete(srvs, randomKey)
-			break
-		}
-	}
-
-	srvs[suStr] = srvLookup{
-		srvUpstreams: su,
-		freshness:    time.Now(),
-		upstreams:    upstreams,
-	}
-
 	return upstreams, nil
 }
 
-type srvLookup struct {
-	srvUpstreams SRVUpstreams
-	freshness    time.Time
-	upstreams    []*Upstream
+func (su SRVUpstreams) String() string {
+	if su.Service == "" && su.Proto == "" {
+		return su.Name
+	}
+	return su.formattedAddr(su.Service, su.Proto, su.Name)
 }
 
-func (sl srvLookup) isFresh() bool {
-	return time.Since(sl.freshness) < time.Duration(sl.srvUpstreams.Refresh)
+// expandedAddr expands placeholders in the configured SRV domain labels.
+// The return values are: addr, the RFC 2782 representation of the SRV domain;
+// service, the service; proto, the protocol; and name, the name.
+// If su.Service and su.Proto are empty, name will be returned as addr instead.
+func (su SRVUpstreams) expandedAddr(r *http.Request) (addr, service, proto, name string) {
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	name = repl.ReplaceAll(su.Name, "")
+	if su.Service == "" && su.Proto == "" {
+		addr = name
+		return addr, service, proto, name
+	}
+	service = repl.ReplaceAll(su.Service, "")
+	proto = repl.ReplaceAll(su.Proto, "")
+	addr = su.formattedAddr(service, proto, name)
+	return addr, service, proto, name
 }
 
-var (
-	srvs   = make(map[string]srvLookup)
-	srvsMu sync.RWMutex
-)
+// formattedAddr the RFC 2782 representation of the SRV domain, in
+// the form "_service._proto.name".
+func (SRVUpstreams) formattedAddr(service, proto, name string) string {
+	return fmt.Sprintf("_%s._%s.%s", service, proto, name)
+}
+
+type IPVersions struct {
+	IPv4 *bool `json:"ipv4,omitempty"`
+	IPv6 *bool `json:"ipv6,omitempty"`
+}
+
+func resolveIpVersion(versions *IPVersions) string {
+	resolveIpv4 := versions == nil || (versions.IPv4 == nil && versions.IPv6 == nil) || (versions.IPv4 != nil && *versions.IPv4)
+	resolveIpv6 := versions == nil || (versions.IPv6 == nil && versions.IPv4 == nil) || (versions.IPv6 != nil && *versions.IPv6)
+	switch {
+	case resolveIpv4 && !resolveIpv6:
+		return "ip4"
+	case !resolveIpv4 && resolveIpv6:
+		return "ip6"
+	default:
+		return "ip"
+	}
+}
 
 // AUpstreams provides upstreams from A/AAAA lookups.
 // Results are cached and refreshed at the configured
@@ -223,7 +233,18 @@ type AUpstreams struct {
 	// A negative value disables this.
 	FallbackDelay caddy.Duration `json:"dial_fallback_delay,omitempty"`
 
+	// The IP versions to resolve for. By default, both
+	// "ipv4" and "ipv6" will be enabled, which
+	// correspond to A and AAAA records respectively.
+	Versions *IPVersions `json:"versions,omitempty"`
+
 	resolver *net.Resolver
+
+	// resolverKey identifies resolver for the shared DNS cache; see the same
+	// field on SRVUpstreams. Empty for the default resolver.
+	resolverKey string
+
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -234,9 +255,8 @@ func (AUpstreams) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (au AUpstreams) String() string { return au.Name }
-
-func (au *AUpstreams) Provision(_ caddy.Context) error {
+func (au *AUpstreams) Provision(ctx caddy.Context) error {
+	au.logger = ctx.Logger()
 	if au.Refresh == 0 {
 		au.Refresh = caddy.Duration(time.Minute)
 	}
@@ -257,7 +277,7 @@ func (au *AUpstreams) Provision(_ caddy.Context) error {
 			PreferGo: true,
 			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				//nolint:gosec
-				addr := au.Resolver.netAddrs[weakrand.Intn(len(au.Resolver.netAddrs))]
+				addr := au.Resolver.netAddrs[weakrand.IntN(len(au.Resolver.netAddrs))]
 				return d.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
 			},
 		}
@@ -265,74 +285,124 @@ func (au *AUpstreams) Provision(_ caddy.Context) error {
 	if au.resolver == nil {
 		au.resolver = net.DefaultResolver
 	}
+	au.resolverKey = resolverCacheKey(au.Resolver)
 
 	return nil
 }
 
+// ResetCache clears the cached lookup for the given request, or the entire
+// A/AAAA cache if r is nil.
+func (au *AUpstreams) ResetCache(r *http.Request) error {
+	if r == nil {
+		network.ResetAllA()
+		return nil
+	}
+	ipVersion, name, port := au.expandedAddr(r)
+	network.ResetA(au.resolverKey, ipVersion, name, port)
+	return nil
+}
+
 func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
-	auStr := au.String()
+	ipVersion, name, port := au.expandedAddr(r)
 
-	// first, use a cheap read-lock to return a cached result quickly
-	aAaaaMu.RLock()
-	cached := aAaaa[auStr]
-	aAaaaMu.RUnlock()
-	if cached.isFresh() {
-		return cached.upstreams, nil
-	}
-
-	// otherwise, obtain a write-lock to update the cached value
-	aAaaaMu.Lock()
-	defer aAaaaMu.Unlock()
-
-	// check to see if it's still stale, since we're now in a different
-	// lock from when we first checked freshness; another goroutine might
-	// have refreshed it in the meantime before we re-obtained our lock
-	cached = aAaaa[auStr]
-	if cached.isFresh() {
-		return cached.upstreams, nil
-	}
-
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	name := repl.ReplaceAll(au.Name, "")
-	port := repl.ReplaceAll(au.Port, "")
-
-	ips, err := au.resolver.LookupIPAddr(r.Context(), name)
+	targets, err := network.A(r.Context(), au.resolver.LookupIP,
+		au.resolverKey, ipVersion, name, port, time.Duration(au.Refresh), au.logger)
 	if err != nil {
 		return nil, err
 	}
 
-	upstreams := make([]*Upstream, len(ips))
-	for i, ip := range ips {
-		upstreams[i] = &Upstream{
-			Dial: net.JoinHostPort(ip.String(), port),
-		}
+	upstreams := make([]*Upstream, len(targets))
+	for i, t := range targets {
+		upstreams[i] = &Upstream{Dial: net.JoinHostPort(t.Host, t.Port)}
 	}
-
-	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
-	if cached.freshness.IsZero() && len(srvs) >= 100 {
-		for randomKey := range aAaaa {
-			delete(aAaaa, randomKey)
-			break
-		}
-	}
-
-	aAaaa[auStr] = aLookup{
-		aUpstreams: au,
-		freshness:  time.Now(),
-		upstreams:  upstreams,
-	}
-
 	return upstreams, nil
 }
 
-type aLookup struct {
-	aUpstreams AUpstreams
-	freshness  time.Time
-	upstreams  []*Upstream
+func (au AUpstreams) String() string { return net.JoinHostPort(au.Name, au.Port) }
+
+// expandedAddr returns the IP version to resolve and the placeholder-expanded
+// name and port, which together identify the request's cache entry.
+func (au AUpstreams) expandedAddr(r *http.Request) (ipVersion, name, port string) {
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	return resolveIpVersion(au.Versions), repl.ReplaceAll(au.Name, ""), repl.ReplaceAll(au.Port, "")
 }
 
-func (al aLookup) isFresh() bool {
-	return time.Since(al.freshness) < time.Duration(al.aUpstreams.Refresh)
+// MultiUpstreams is a single dynamic upstream source that
+// aggregates the results of multiple dynamic upstream sources.
+// All configured sources will be queried in order, with their
+// results appended to the end of the list. Errors returned
+// from individual sources will be logged and the next source
+// will continue to be invoked.
+//
+// This module makes it easy to implement redundant cluster
+// failovers, especially in conjunction with the `first` load
+// balancing policy: if the first source returns an error or
+// no upstreams, the second source's upstreams will be used
+// naturally.
+type MultiUpstreams struct {
+	// The list of upstream source modules to get upstreams from.
+	// They will be queried in order, with their results appended
+	// in the order they are returned.
+	SourcesRaw []json.RawMessage `json:"sources,omitempty" caddy:"namespace=http.reverse_proxy.upstreams inline_key=source"`
+	sources    []UpstreamSource
+
+	logger *zap.Logger
+}
+
+// CaddyModule returns the Caddy module information.
+func (MultiUpstreams) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.reverse_proxy.upstreams.multi",
+		New: func() caddy.Module { return new(MultiUpstreams) },
+	}
+}
+
+func (mu *MultiUpstreams) Provision(ctx caddy.Context) error {
+	mu.logger = ctx.Logger()
+
+	if mu.SourcesRaw != nil {
+		mod, err := ctx.LoadModule(mu, "SourcesRaw")
+		if err != nil {
+			return fmt.Errorf("loading upstream source modules: %v", err)
+		}
+		sources := mod.([]any)
+		mu.sources = make([]UpstreamSource, 0, len(sources))
+		for _, src := range sources {
+			mu.sources = append(mu.sources, src.(UpstreamSource))
+		}
+	}
+
+	return nil
+}
+
+func (mu MultiUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
+	var upstreams []*Upstream
+
+	for i, src := range mu.sources {
+		select {
+		case <-r.Context().Done():
+			return upstreams, context.Canceled
+		default:
+		}
+
+		up, err := src.GetUpstreams(r)
+		if err != nil {
+			if c := mu.logger.Check(zapcore.ErrorLevel, "upstream source returned error"); c != nil {
+				c.Write(
+					zap.Int("source_idx", i),
+					zap.Error(err),
+				)
+			}
+		} else if len(up) == 0 {
+			if c := mu.logger.Check(zapcore.WarnLevel, "upstream source returned 0 upstreams"); c != nil {
+				c.Write(zap.Int("source_idx", i))
+			}
+		} else {
+			upstreams = append(upstreams, up...)
+		}
+	}
+
+	return upstreams, nil
 }
 
 // UpstreamResolver holds the set of addresses of DNS resolvers of
@@ -350,8 +420,9 @@ type UpstreamResolver struct {
 // ParseAddresses parses all the configured network addresses
 // and ensures they're ready to be used.
 func (u *UpstreamResolver) ParseAddresses() error {
+	u.netAddrs = make([]caddy.NetworkAddress, 0, len(u.Addresses))
 	for _, v := range u.Addresses {
-		addr, err := caddy.ParseNetworkAddress(v)
+		addr, err := caddy.ParseNetworkAddressWithDefaults(v, "udp", 53)
 		if err != nil {
 			return err
 		}
@@ -363,15 +434,38 @@ func (u *UpstreamResolver) ParseAddresses() error {
 	return nil
 }
 
-var (
-	aAaaa   = make(map[string]aLookup)
-	aAaaaMu sync.RWMutex
-)
+// resolverCacheKey returns a stable identity for the configured resolver, used
+// to key the shared DNS cache so that two upstream sources looking up the same
+// name with different resolvers do not share a cache entry. The default
+// resolver (no Resolver configured) yields "". Addresses are sorted so that the
+// same set in a different order maps to the same key.
+//
+// Each address is length-prefixed ("<len>:<addr>") rather than joined with a
+// separator, so the encoding is unambiguous even when an address itself
+// contains the separator — e.g. a Unix-socket resolver path with a comma.
+// Without this, {"a,b"} and {"a", "b"} would collide, defeating the very
+// isolation this key provides.
+func resolverCacheKey(r *UpstreamResolver) string {
+	if r == nil || len(r.Addresses) == 0 {
+		return ""
+	}
+	addrs := slices.Clone(r.Addresses)
+	slices.Sort(addrs)
+	var b strings.Builder
+	for _, a := range addrs {
+		b.WriteString(strconv.Itoa(len(a)))
+		b.WriteByte(':')
+		b.WriteString(a)
+	}
+	return b.String()
+}
 
 // Interface guards
 var (
-	_ caddy.Provisioner = (*SRVUpstreams)(nil)
-	_ UpstreamSource    = (*SRVUpstreams)(nil)
-	_ caddy.Provisioner = (*AUpstreams)(nil)
-	_ UpstreamSource    = (*AUpstreams)(nil)
+	_ caddy.Provisioner     = (*SRVUpstreams)(nil)
+	_ UpstreamSource        = (*SRVUpstreams)(nil)
+	_ CachingUpstreamSource = (*SRVUpstreams)(nil)
+	_ caddy.Provisioner     = (*AUpstreams)(nil)
+	_ UpstreamSource        = (*AUpstreams)(nil)
+	_ CachingUpstreamSource = (*AUpstreams)(nil)
 )

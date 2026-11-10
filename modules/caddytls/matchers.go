@@ -15,19 +15,33 @@
 package caddytls
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"golang.org/x/net/idna"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/internal"
 )
 
 func init() {
 	caddy.RegisterModule(MatchServerName{})
+	caddy.RegisterModule(MatchServerNameRE{})
 	caddy.RegisterModule(MatchRemoteIP{})
+	caddy.RegisterModule(MatchLocalIP{})
+	caddy.RegisterModule(MatchNot{})
 }
 
 // MatchServerName matches based on SNI. Names in
@@ -45,12 +59,249 @@ func (MatchServerName) CaddyModule() caddy.ModuleInfo {
 
 // Match matches hello based on SNI.
 func (m MatchServerName) Match(hello *tls.ClientHelloInfo) bool {
+	var repl *caddy.Replacer
+	// caddytls.TestServerNameMatcher calls this function without any context
+	if ctx := hello.Context(); ctx != nil {
+		// In some situations the existing context may have no replacer
+		if replAny := ctx.Value(caddy.ReplacerCtxKey); replAny != nil {
+			repl = replAny.(*caddy.Replacer)
+		}
+	}
+
+	if repl == nil {
+		repl = caddy.NewReplacer()
+	}
+
+	serverName := asciiServerNameForMatch(hello.ServerName)
 	for _, name := range m {
-		if certmagic.MatchWildcard(hello.ServerName, name) {
+		rs := asciiServerNameForMatch(repl.ReplaceAll(name, ""))
+		if certmagic.MatchWildcard(serverName, rs) {
 			return true
 		}
 	}
 	return false
+}
+
+func asciiServerNameForMatch(name string) string {
+	if name == "" {
+		return name
+	}
+
+	// Fast path: if the name is pure ASCII, skip idna.ToASCII.
+	// SNI values on the wire are always ASCII (RFC 6066), and most
+	// config patterns are also ASCII. For pure ASCII input, idna.ToASCII
+	// only validates and lowercases, which is equivalent to our fallback.
+	if isPureASCII(name) {
+		return strings.ToLower(name)
+	}
+
+	// Config can use Unicode IDNs.
+	ascii, err := idna.ToASCII(name)
+	if err == nil {
+		return strings.ToLower(ascii)
+	}
+
+	if !strings.Contains(name, "*") {
+		return strings.ToLower(name)
+	}
+
+	labels := strings.Split(name, ".")
+	for i, label := range labels {
+		if label == "" || label == "*" {
+			continue
+		}
+		ascii, err := idna.ToASCII(label)
+		if err != nil {
+			return strings.ToLower(name)
+		}
+		labels[i] = strings.ToLower(ascii)
+	}
+	return strings.Join(labels, ".")
+}
+
+func isPureASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// UnmarshalCaddyfile sets up the MatchServerName from Caddyfile tokens. Syntax:
+//
+//	sni <domains...>
+func (m *MatchServerName) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		wrapper := d.Val()
+
+		// At least one same-line option must be provided
+		if d.CountRemainingArgs() == 0 {
+			return d.ArgErr()
+		}
+
+		*m = append(*m, d.RemainingArgs()...)
+
+		// No blocks are supported
+		if d.NextBlock(d.Nesting()) {
+			return d.Errf("malformed TLS handshake matcher '%s': blocks are not supported", wrapper)
+		}
+	}
+
+	return nil
+}
+
+// MatchRegexp is an embeddable type for matching
+// using regular expressions. It adds placeholders
+// to the request's replacer. In fact, it is a copy of
+// caddyhttp.MatchRegexp with a local replacer prefix
+// and placeholders support in a regular expression pattern.
+type MatchRegexp struct {
+	// A unique name for this regular expression. Optional,
+	// but useful to prevent overwriting captures from other
+	// regexp matchers.
+	Name string `json:"name,omitempty"`
+
+	// The regular expression to evaluate, in RE2 syntax,
+	// which is the same general syntax used by Go, Perl,
+	// and Python. For details, see
+	// [Go's regexp package](https://golang.org/pkg/regexp/).
+	// Captures are accessible via placeholders. Unnamed
+	// capture groups are exposed as their numeric, 1-based
+	// index, while named capture groups are available by
+	// the capture group name.
+	Pattern string `json:"pattern"`
+
+	compiled *regexp.Regexp
+}
+
+// Provision compiles the regular expression which may include placeholders.
+func (mre *MatchRegexp) Provision(caddy.Context) error {
+	repl := caddy.NewReplacer()
+	re, err := regexp.Compile(repl.ReplaceAll(mre.Pattern, ""))
+	if err != nil {
+		return fmt.Errorf("compiling matcher regexp %s: %v", mre.Pattern, err)
+	}
+	mre.compiled = re
+	return nil
+}
+
+// Validate ensures mre is set up correctly.
+func (mre *MatchRegexp) Validate() error {
+	if mre.Name != "" && !wordRE.MatchString(mre.Name) {
+		return fmt.Errorf("invalid regexp name (must contain only word characters): %s", mre.Name)
+	}
+	return nil
+}
+
+// Match returns true if input matches the compiled regular
+// expression in m. It sets values on the replacer repl
+// associated with capture groups, using the given scope
+// (namespace).
+func (mre *MatchRegexp) Match(input string, repl *caddy.Replacer) bool {
+	matches := mre.compiled.FindStringSubmatch(input)
+	if matches == nil {
+		return false
+	}
+
+	// save all capture groups, first by index
+	for i, match := range matches {
+		keySuffix := "." + strconv.Itoa(i)
+		if mre.Name != "" {
+			repl.Set(regexpPlaceholderPrefix+"."+mre.Name+keySuffix, match)
+		}
+		repl.Set(regexpPlaceholderPrefix+keySuffix, match)
+	}
+
+	// then by name
+	for i, name := range mre.compiled.SubexpNames() {
+		// skip the first element (the full match), and empty names
+		if i == 0 || name == "" {
+			continue
+		}
+
+		keySuffix := "." + name
+		if mre.Name != "" {
+			repl.Set(regexpPlaceholderPrefix+"."+mre.Name+keySuffix, matches[i])
+		}
+		repl.Set(regexpPlaceholderPrefix+keySuffix, matches[i])
+	}
+
+	return true
+}
+
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+func (mre *MatchRegexp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// iterate to merge multiple matchers into one
+	for d.Next() {
+		// If this is the second iteration of the loop
+		// then there's more than one *_regexp matcher,
+		// and we would end up overwriting the old one
+		if mre.Pattern != "" {
+			return d.Err("regular expression can only be used once per named matcher")
+		}
+
+		args := d.RemainingArgs()
+		switch len(args) {
+		case 1:
+			mre.Pattern = args[0]
+		case 2:
+			mre.Name = args[0]
+			mre.Pattern = args[1]
+		default:
+			return d.ArgErr()
+		}
+
+		// Default to the named matcher's name, if no regexp name is provided.
+		// Note: it requires d.SetContext(caddyfile.MatcherNameCtxKey, value)
+		// called before this unmarshalling, otherwise it wouldn't work.
+		if mre.Name == "" {
+			mre.Name = d.GetContextString(caddyfile.MatcherNameCtxKey)
+		}
+
+		if d.NextBlock(0) {
+			return d.Err("malformed regexp matcher: blocks are not supported")
+		}
+	}
+	return nil
+}
+
+// MatchServerNameRE matches based on SNI using a regular expression.
+type MatchServerNameRE struct{ MatchRegexp }
+
+// CaddyModule returns the Caddy module information.
+func (MatchServerNameRE) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "tls.handshake_match.sni_regexp",
+		New: func() caddy.Module { return new(MatchServerNameRE) },
+	}
+}
+
+// Match matches hello based on SNI using a regular expression.
+func (m MatchServerNameRE) Match(hello *tls.ClientHelloInfo) bool {
+	// Note: caddytls.TestServerNameMatcher calls this function without any context
+	ctx := hello.Context()
+	if ctx == nil {
+		// layer4.Connection implements GetContext() to pass its context here,
+		// since hello.Context() returns nil
+		if mayHaveContext, ok := hello.Conn.(interface{ GetContext() context.Context }); ok {
+			ctx = mayHaveContext.GetContext()
+		}
+	}
+
+	var repl *caddy.Replacer
+	if ctx != nil {
+		// In some situations the existing context may have no replacer
+		if replAny := ctx.Value(caddy.ReplacerCtxKey); replAny != nil {
+			repl = replAny.(*caddy.Replacer)
+		}
+	}
+
+	if repl == nil {
+		repl = caddy.NewReplacer()
+	}
+
+	return m.MatchRegexp.Match(hello.ServerName, repl)
 }
 
 // MatchRemoteIP matches based on the remote IP of the
@@ -65,8 +316,8 @@ type MatchRemoteIP struct {
 	// The IPs or CIDR ranges to *NOT* match.
 	NotRanges []string `json:"not_ranges,omitempty"`
 
-	cidrs    []*net.IPNet
-	notCidrs []*net.IPNet
+	cidrs    []netip.Prefix
+	notCidrs []netip.Prefix
 	logger   *zap.Logger
 }
 
@@ -80,16 +331,19 @@ func (MatchRemoteIP) CaddyModule() caddy.ModuleInfo {
 
 // Provision parses m's IP ranges, either from IP or CIDR expressions.
 func (m *MatchRemoteIP) Provision(ctx caddy.Context) error {
-	m.logger = ctx.Logger(m)
+	repl := caddy.NewReplacer()
+	m.logger = ctx.Logger()
 	for _, str := range m.Ranges {
-		cidrs, err := m.parseIPRange(str)
+		rs := repl.ReplaceAll(str, "")
+		cidrs, err := m.parseIPRange(rs)
 		if err != nil {
 			return err
 		}
 		m.cidrs = append(m.cidrs, cidrs...)
 	}
 	for _, str := range m.NotRanges {
-		cidrs, err := m.parseIPRange(str)
+		rs := repl.ReplaceAll(str, "")
+		cidrs, err := m.parseIPRange(rs)
 		if err != nil {
 			return err
 		}
@@ -105,48 +359,315 @@ func (m MatchRemoteIP) Match(hello *tls.ClientHelloInfo) bool {
 	if err != nil {
 		ipStr = remoteAddr // weird; maybe no port?
 	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		m.logger.Error("invalid client IP addresss", zap.String("ip", ipStr))
+	ipAddr, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		if c := m.logger.Check(zapcore.ErrorLevel, "invalid client IP address"); c != nil {
+			c.Write(zap.String("ip", ipStr))
+		}
 		return false
 	}
-	return (len(m.cidrs) == 0 || m.matches(ip, m.cidrs)) &&
-		(len(m.notCidrs) == 0 || !m.matches(ip, m.notCidrs))
+	return (len(m.cidrs) == 0 || m.matches(ipAddr, m.cidrs)) &&
+		(len(m.notCidrs) == 0 || !m.matches(ipAddr, m.notCidrs))
 }
 
-func (MatchRemoteIP) parseIPRange(str string) ([]*net.IPNet, error) {
-	var cidrs []*net.IPNet
+func (MatchRemoteIP) parseIPRange(str string) ([]netip.Prefix, error) {
+	var cidrs []netip.Prefix
 	if strings.Contains(str, "/") {
-		_, ipNet, err := net.ParseCIDR(str)
+		ipNet, err := netip.ParsePrefix(str)
 		if err != nil {
 			return nil, fmt.Errorf("parsing CIDR expression: %v", err)
 		}
 		cidrs = append(cidrs, ipNet)
 	} else {
-		ip := net.ParseIP(str)
-		if ip == nil {
-			return nil, fmt.Errorf("invalid IP address: %s", str)
+		ipAddr, err := netip.ParseAddr(str)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IP address: '%s': %v", str, err)
 		}
-		mask := len(ip) * 8
-		cidrs = append(cidrs, &net.IPNet{
-			IP:   ip,
-			Mask: net.CIDRMask(mask, mask),
-		})
+		ip := netip.PrefixFrom(ipAddr, ipAddr.BitLen())
+		cidrs = append(cidrs, ip)
 	}
 	return cidrs, nil
 }
 
-func (MatchRemoteIP) matches(ip net.IP, ranges []*net.IPNet) bool {
-	for _, ipRange := range ranges {
-		if ipRange.Contains(ip) {
-			return true
+func (MatchRemoteIP) matches(ip netip.Addr, ranges []netip.Prefix) bool {
+	return slices.ContainsFunc(ranges, func(prefix netip.Prefix) bool {
+		return prefix.Contains(ip)
+	})
+}
+
+// UnmarshalCaddyfile sets up the MatchRemoteIP from Caddyfile tokens. Syntax:
+//
+//	remote_ip <ranges...>
+//
+// Note: IPs and CIDRs prefixed with ! symbol are treated as not_ranges
+func (m *MatchRemoteIP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		wrapper := d.Val()
+
+		// At least one same-line option must be provided
+		if d.CountRemainingArgs() == 0 {
+			return d.ArgErr()
+		}
+
+		for d.NextArg() {
+			val := d.Val()
+			var exclamation bool
+			if len(val) > 1 && val[0] == '!' {
+				exclamation, val = true, val[1:]
+			}
+			ranges := []string{val}
+			if val == "private_ranges" {
+				ranges = internal.PrivateRangesCIDR()
+			}
+			if exclamation {
+				m.NotRanges = append(m.NotRanges, ranges...)
+			} else {
+				m.Ranges = append(m.Ranges, ranges...)
+			}
+		}
+
+		// No blocks are supported
+		if d.NextBlock(d.Nesting()) {
+			return d.Errf("malformed TLS handshake matcher '%s': blocks are not supported", wrapper)
 		}
 	}
-	return false
+
+	return nil
+}
+
+// MatchLocalIP matches based on the IP address of the interface
+// receiving the connection. Specific IPs or CIDR ranges can be specified.
+type MatchLocalIP struct {
+	// The IPs or CIDR ranges to match.
+	Ranges []string `json:"ranges,omitempty"`
+
+	cidrs  []netip.Prefix
+	logger *zap.Logger
+}
+
+// CaddyModule returns the Caddy module information.
+func (MatchLocalIP) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "tls.handshake_match.local_ip",
+		New: func() caddy.Module { return new(MatchLocalIP) },
+	}
+}
+
+// Provision parses m's IP ranges, either from IP or CIDR expressions.
+func (m *MatchLocalIP) Provision(ctx caddy.Context) error {
+	repl := caddy.NewReplacer()
+	m.logger = ctx.Logger()
+	for _, str := range m.Ranges {
+		rs := repl.ReplaceAll(str, "")
+		cidrs, err := m.parseIPRange(rs)
+		if err != nil {
+			return err
+		}
+		m.cidrs = append(m.cidrs, cidrs...)
+	}
+	return nil
+}
+
+// Match matches hello based on the connection's remote IP.
+func (m MatchLocalIP) Match(hello *tls.ClientHelloInfo) bool {
+	localAddr := hello.Conn.LocalAddr().String()
+	ipStr, _, err := net.SplitHostPort(localAddr)
+	if err != nil {
+		ipStr = localAddr // weird; maybe no port?
+	}
+	ipAddr, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		if c := m.logger.Check(zapcore.ErrorLevel, "invalid local IP address"); c != nil {
+			c.Write(zap.String("ip", ipStr))
+		}
+		return false
+	}
+	return (len(m.cidrs) == 0 || m.matches(ipAddr, m.cidrs))
+}
+
+func (MatchLocalIP) parseIPRange(str string) ([]netip.Prefix, error) {
+	var cidrs []netip.Prefix
+	if strings.Contains(str, "/") {
+		ipNet, err := netip.ParsePrefix(str)
+		if err != nil {
+			return nil, fmt.Errorf("parsing CIDR expression: %v", err)
+		}
+		cidrs = append(cidrs, ipNet)
+	} else {
+		ipAddr, err := netip.ParseAddr(str)
+		if err != nil {
+			return nil, fmt.Errorf("invalid IP address: '%s': %v", str, err)
+		}
+		ip := netip.PrefixFrom(ipAddr, ipAddr.BitLen())
+		cidrs = append(cidrs, ip)
+	}
+	return cidrs, nil
+}
+
+func (MatchLocalIP) matches(ip netip.Addr, ranges []netip.Prefix) bool {
+	return slices.ContainsFunc(ranges, func(prefix netip.Prefix) bool {
+		return prefix.Contains(ip)
+	})
+}
+
+// UnmarshalCaddyfile sets up the MatchLocalIP from Caddyfile tokens. Syntax:
+//
+//	local_ip <ranges...>
+func (m *MatchLocalIP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		wrapper := d.Val()
+
+		// At least one same-line option must be provided
+		if d.CountRemainingArgs() == 0 {
+			return d.ArgErr()
+		}
+
+		for d.NextArg() {
+			val := d.Val()
+			if val == "private_ranges" {
+				m.Ranges = append(m.Ranges, internal.PrivateRangesCIDR()...)
+				continue
+			}
+			m.Ranges = append(m.Ranges, val)
+		}
+
+		// No blocks are supported
+		if d.NextBlock(d.Nesting()) {
+			return d.Errf("malformed TLS handshake matcher '%s': blocks are not supported", wrapper)
+		}
+	}
+
+	return nil
+}
+
+// MatchNot matches a TLS handshake by negating the results of its
+// matcher sets. A single "not" matcher takes one or more matcher sets.
+// Each matcher set is OR'ed; in other words, if any matcher set returns
+// true, the final result of the "not" matcher is false. Individual
+// matchers within a set work the same (i.e. different matchers in
+// the same set are AND'ed).
+//
+// NOTE: The generated docs which describe the structure of this
+// module are wrong because of how this type unmarshals JSON in a
+// custom way. The correct structure is:
+//
+// ```json
+// [{}, {}]
+// ```
+//
+// where each of the array elements is a matcher set, i.e. an
+// object keyed by matcher name.
+type MatchNot struct {
+	MatcherSetsRaw []caddy.ModuleMap `json:"-" caddy:"namespace=tls.handshake_match"`
+
+	matcherSets [][]ConnectionMatcher
+}
+
+// CaddyModule returns the Caddy module information.
+func (MatchNot) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "tls.handshake_match.not",
+		New: func() caddy.Module { return new(MatchNot) },
+	}
+}
+
+// UnmarshalJSON satisfies json.Unmarshaler. It puts the JSON
+// bytes directly into m's MatcherSetsRaw field.
+func (m *MatchNot) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, &m.MatcherSetsRaw)
+}
+
+// MarshalJSON satisfies json.Marshaler by marshaling
+// m's raw matcher sets.
+func (m MatchNot) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.MatcherSetsRaw)
+}
+
+// Provision loads the matcher modules to be negated.
+func (m *MatchNot) Provision(ctx caddy.Context) error {
+	matcherSets, err := ctx.LoadModule(m, "MatcherSetsRaw")
+	if err != nil {
+		return fmt.Errorf("loading matcher sets: %v", err)
+	}
+	for _, modMap := range matcherSets.([]map[string]any) {
+		var ms []ConnectionMatcher
+		for _, modIface := range modMap {
+			cm, ok := modIface.(ConnectionMatcher)
+			if !ok {
+				return fmt.Errorf("module is not a TLS handshake matcher: %T", modIface)
+			}
+			ms = append(ms, cm)
+		}
+		m.matcherSets = append(m.matcherSets, ms)
+	}
+	return nil
+}
+
+// Match returns true if hello does not match any of m's
+// matcher sets.
+func (m MatchNot) Match(hello *tls.ClientHelloInfo) bool {
+setLoop:
+	for _, ms := range m.matcherSets {
+		for _, matcher := range ms {
+			if !matcher.Match(hello) {
+				continue setLoop
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// UnmarshalCaddyfile sets up the MatchNot from Caddyfile tokens. Syntax:
+//
+//	not <matcher> [<args...>]
+//	not {
+//		<matcher> [<args...>]
+//	}
+func (m *MatchNot) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// iterate to merge multiple matchers into one
+	for d.Next() {
+		wrapper := d.Val()
+
+		matcherSet, err := ParseCaddyfileNestedMatcherSet(d)
+		if err != nil {
+			return err
+		}
+
+		// At least one matcher must be provided
+		if len(matcherSet) == 0 {
+			return d.Errf("malformed TLS handshake matcher '%s': no matchers to negate", wrapper)
+		}
+
+		m.MatcherSetsRaw = append(m.MatcherSetsRaw, matcherSet)
+	}
+
+	return nil
 }
 
 // Interface guards
 var (
-	_ ConnectionMatcher = (*MatchServerName)(nil)
+	_ ConnectionMatcher = (*MatchLocalIP)(nil)
+	_ ConnectionMatcher = (*MatchNot)(nil)
 	_ ConnectionMatcher = (*MatchRemoteIP)(nil)
+	_ ConnectionMatcher = (*MatchServerName)(nil)
+	_ ConnectionMatcher = (*MatchServerNameRE)(nil)
+
+	_ caddy.Provisioner = (*MatchLocalIP)(nil)
+	_ caddy.Provisioner = (*MatchNot)(nil)
+	_ caddy.Provisioner = (*MatchRemoteIP)(nil)
+	_ caddy.Provisioner = (*MatchServerNameRE)(nil)
+
+	_ caddyfile.Unmarshaler = (*MatchLocalIP)(nil)
+	_ caddyfile.Unmarshaler = (*MatchNot)(nil)
+	_ caddyfile.Unmarshaler = (*MatchRemoteIP)(nil)
+	_ caddyfile.Unmarshaler = (*MatchServerName)(nil)
+	_ caddyfile.Unmarshaler = (*MatchServerNameRE)(nil)
+
+	_ json.Marshaler   = (*MatchNot)(nil)
+	_ json.Unmarshaler = (*MatchNot)(nil)
 )
+
+var wordRE = regexp.MustCompile(`\w+`)
+
+const regexpPlaceholderPrefix = "tls.regexp"

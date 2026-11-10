@@ -29,9 +29,9 @@ type linkResource struct {
 //
 // Accepted formats are:
 //
-//     Link: <resource>; as=script
-//     Link: <resource>; as=script,<resource>; as=style
-//     Link: <resource>;<resource2>
+//	Link: <resource>; as=script
+//	Link: <resource>; as=script,<resource>; as=style
+//	Link: <resource>;<resource2>
 //
 // where <resource> begins with a forward slash (/).
 func parseLinkHeader(header string) []linkResource {
@@ -41,7 +41,7 @@ func parseLinkHeader(header string) []linkResource {
 		return resources
 	}
 
-	for _, link := range strings.Split(header, comma) {
+	for link := range strings.SplitSeq(header, comma) {
 		l := linkResource{params: make(map[string]string)}
 
 		li, ri := strings.Index(link, "<"), strings.Index(link, ">")
@@ -51,17 +51,16 @@ func parseLinkHeader(header string) []linkResource {
 
 		l.uri = strings.TrimSpace(link[li+1 : ri])
 
-		for _, param := range strings.Split(strings.TrimSpace(link[ri+1:]), semicolon) {
-			parts := strings.SplitN(strings.TrimSpace(param), equal, 2)
-			key := strings.TrimSpace(parts[0])
+		for param := range strings.SplitSeq(strings.TrimSpace(link[ri+1:]), semicolon) {
+			before, after, isCut := strings.Cut(strings.TrimSpace(param), equal)
+			key := strings.TrimSpace(before)
 			if key == "" {
 				continue
 			}
-			if len(parts) == 1 {
+			if isCut {
+				l.params[key] = strings.TrimSpace(after)
+			} else {
 				l.params[key] = key
-			}
-			if len(parts) == 2 {
-				l.params[key] = strings.TrimSpace(parts[1])
 			}
 		}
 

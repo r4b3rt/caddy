@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -40,6 +41,7 @@ type Handler struct {
 	Source string `json:"source,omitempty"`
 
 	// Destinations are the names of placeholders in which to store the outputs.
+	// Destination values should be wrapped in braces, for example, {my_placeholder}.
 	Destinations []string `json:"destinations,omitempty"`
 
 	// Mappings from source values (inputs) to destination values (outputs).
@@ -62,7 +64,12 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision sets up h.
 func (h *Handler) Provision(_ caddy.Context) error {
 	for j, dest := range h.Destinations {
-		h.Destinations[j] = strings.Trim(dest, "{}")
+		if !strings.HasPrefix(dest, "{") || !strings.HasSuffix(dest, "}") ||
+			strings.Count(dest, "{") != 1 || strings.Count(dest, "}") != 1 ||
+			len(dest) < 3 {
+			return fmt.Errorf("destination %d must be a placeholder and only a placeholder, but got '%s'", j, dest)
+		}
+		h.Destinations[j] = dest[1 : len(dest)-1]
 	}
 
 	for i, m := range h.Mappings {
@@ -89,7 +96,8 @@ func (h *Handler) Validate() error {
 		return fmt.Errorf("%d destinations != %d defaults", nDest, nDef)
 	}
 
-	seen := make(map[string]int)
+	seenLiterals := make(map[string]int)
+	seenRegexps := make(map[string]int)
 	for i, m := range h.Mappings {
 		// prevent confusing/ambiguous mappings
 		if m.Input != "" && m.InputRegexp != "" {
@@ -97,9 +105,9 @@ func (h *Handler) Validate() error {
 		}
 
 		// prevent duplicate mappings
-		input := m.Input
+		input, seen := m.Input, seenLiterals
 		if m.InputRegexp != "" {
-			input = m.InputRegexp
+			input, seen = m.InputRegexp, seenRegexps
 		}
 		if prev, ok := seen[input]; ok {
 			return fmt.Errorf("mapping %d has a duplicate input '%s' previously used with mapping %d", i, input, prev)
@@ -112,6 +120,7 @@ func (h *Handler) Validate() error {
 			return fmt.Errorf("mapping %d has %d outputs but there are %d destinations defined", i, nOut, nDest)
 		}
 	}
+
 	return nil
 }
 
@@ -119,9 +128,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	// defer work until a variable is actually evaluated by using replacer's Map callback
-	repl.Map(func(key string) (interface{}, bool) {
+	repl.Map(func(key string) (any, bool) {
 		// return early if the variable is not even a configured destination
-		destIdx := h.destinationIndex(key)
+		destIdx := slices.Index(h.Destinations, key)
 		if destIdx < 0 {
 			return nil, false
 		}
@@ -135,40 +144,34 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 			if output == nil {
 				continue
 			}
+			outputStr := caddy.ToString(output)
+
+			// evaluate regular expression if configured
 			if m.re != nil {
 				var result []byte
 				matches := m.re.FindStringSubmatchIndex(input)
 				if matches == nil {
 					continue
 				}
-				result = m.re.ExpandString(result, output.(string), input, matches)
+				result = m.re.ExpandString(result, outputStr, input, matches)
 				return string(result), true
 			}
+
+			// otherwise simple string comparison
 			if input == m.Input {
-				return output, true
+				return repl.ReplaceAll(outputStr, ""), true
 			}
 		}
 
 		// fall back to default if no match or if matched nil value
 		if len(h.Defaults) > destIdx {
-			return h.Defaults[destIdx], true
+			return repl.ReplaceAll(h.Defaults[destIdx], ""), true
 		}
 
 		return nil, true
 	})
 
 	return next.ServeHTTP(w, r)
-}
-
-// destinationIndex returns the positional index of the destination
-// is name is a known destination; otherwise it returns -1.
-func (h Handler) destinationIndex(name string) int {
-	for i, dest := range h.Destinations {
-		if dest == name {
-			return i
-		}
-	}
-	return -1
 }
 
 // Mapping describes a mapping from input to outputs.
@@ -183,7 +186,7 @@ type Mapping struct {
 	// Upon a match with the input, each output is positionally correlated
 	// with each destination of the parent handler. An output that is null
 	// (nil) will be treated as if it was not mapped at all.
-	Outputs []interface{} `json:"outputs,omitempty"`
+	Outputs []any `json:"outputs,omitempty"`
 
 	re *regexp.Regexp
 }

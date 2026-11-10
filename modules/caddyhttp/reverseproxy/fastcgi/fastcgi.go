@@ -15,23 +15,32 @@
 package fastcgi
 
 import (
-	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
-	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
+)
+
+var (
+	ErrInvalidSplitPath = errors.New("split path contains non-ASCII characters")
+
+	noopLogger = zap.NewNop()
 )
 
 func init() {
@@ -48,6 +57,9 @@ type Transport struct {
 	// with the value of SplitPath. The first piece will be assumed as the
 	// actual resource (CGI script) name, and the second piece will be set to
 	// PATH_INFO for the CGI script to use.
+	//
+	// Split paths can only contain ASCII characters.
+	// Comparison is case-insensitive.
 	//
 	// Future enhancements should be careful to avoid CVE-2019-11043,
 	// which can be mitigated with use of a try_files-like behavior
@@ -74,6 +86,11 @@ type Transport struct {
 	// The duration used to set a deadline when sending to the FastCGI server.
 	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
 
+	// Capture and log any messages sent by the upstream on stderr. Logs at WARN
+	// level by default. If the response has a 4xx or 5xx status ERROR level will
+	// be used instead.
+	CaptureStderr bool `json:"capture_stderr,omitempty"`
+
 	serverSoftware string
 	logger         *zap.Logger
 }
@@ -88,16 +105,14 @@ func (Transport) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up t.
 func (t *Transport) Provision(ctx caddy.Context) error {
-	t.logger = ctx.Logger(t)
+	t.logger = ctx.Logger()
 
 	if t.Root == "" {
 		t.Root = "{http.vars.root}"
 	}
 
-	t.serverSoftware = "Caddy"
-	if mod := caddy.GoModule(); mod.Version != "" {
-		t.serverSoftware += "/" + mod.Version
-	}
+	version, _ := caddy.Version()
+	t.serverSoftware = "Caddy/" + version
 
 	// Set a relatively short default dial timeout.
 	// This is helpful to make load-balancer retries more speedy.
@@ -105,11 +120,57 @@ func (t *Transport) Provision(ctx caddy.Context) error {
 		t.DialTimeout = caddy.Duration(3 * time.Second)
 	}
 
+	var b strings.Builder
+
+	for i, split := range t.SplitPath {
+		b.Grow(len(split))
+
+		for j := 0; j < len(split); j++ {
+			c := split[j]
+			if c >= utf8.RuneSelf {
+				return ErrInvalidSplitPath
+			}
+
+			if 'A' <= c && c <= 'Z' {
+				b.WriteByte(c + 'a' - 'A')
+			} else {
+				b.WriteByte(c)
+			}
+		}
+
+		t.SplitPath[i] = b.String()
+		b.Reset()
+	}
+
 	return nil
+}
+
+// DefaultBufferSizes enables request buffering for fastcgi if not configured.
+// This is because most fastcgi servers are php-fpm that require the content length to be set to read the body, golang
+// std has fastcgi implementation that doesn't need this value to process the body, but we can safely assume that's
+// not used.
+// http3 requests have a negative content length for GET and HEAD requests, if that header is not sent.
+// see: https://github.com/caddyserver/caddy/issues/6678#issuecomment-2472224182
+// Though it appears even if CONTENT_LENGTH is invalid, php-fpm can handle just fine if the body is empty (no Stdin records sent).
+// php-fpm will hang if there is any data in the body though, https://github.com/caddyserver/caddy/issues/5420#issuecomment-2415943516
+
+// TODO: better default buffering for fastcgi requests without content length, in theory a value of 1 should be enough, make it bigger anyway
+func (t Transport) DefaultBufferSizes() (int64, int64) {
+	return 4096, 0
+}
+
+// RequiresContentLength reports that fastcgi cannot forward a body of unknown
+// length: without a valid CONTENT_LENGTH the client rejects the request rather
+// than let the upstream hang, so the request buffer above is the only way to
+// learn the length of a body that does not announce one.
+func (t Transport) RequiresContentLength() bool {
+	return true
 }
 
 // RoundTrip implements http.RoundTripper.
 func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
+	server := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
+
 	// Disallow null bytes in the request path, because
 	// PHP upstreams may do bad things, like execute a
 	// non-PHP file as PHP code. See #4574
@@ -119,16 +180,10 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 	env, err := t.buildEnv(r)
 	if err != nil {
-		return nil, fmt.Errorf("building environment: %v", err)
+		return nil, fmt.Errorf("building environment: %w", err)
 	}
 
-	// TODO: doesn't dialer have a Timeout field?
 	ctx := r.Context()
-	if t.DialTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(t.DialTimeout))
-		defer cancel()
-	}
 
 	// extract dial information from request (should have been embedded by the reverse proxy)
 	network, address := "tcp", r.URL.Host
@@ -137,24 +192,51 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		address = dialInfo.Address
 	}
 
-	t.logger.Debug("roundtrip",
-		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
-		zap.String("dial", address),
-		zap.Object("env", env),
-	)
-
-	fcgiBackend, err := DialContext(ctx, network, address)
-	if err != nil {
-		// TODO: wrap in a special error type if the dial failed, so retries can happen if enabled
-		return nil, fmt.Errorf("dialing backend: %v", err)
+	logCreds := server.Logs != nil && server.Logs.ShouldLogCredentials
+	loggableReq := caddyhttp.LoggableHTTPRequest{
+		Request:              r,
+		ShouldLogCredentials: logCreds,
 	}
-	// fcgiBackend gets closed when response body is closed (see clientCloser)
+	loggableEnv := loggableEnv{vars: env, logCredentials: logCreds}
+
+	logger := t.logger.With(
+		zap.Object("request", loggableReq),
+		zap.Object("env", loggableEnv),
+	)
+	if c := t.logger.Check(zapcore.DebugLevel, "roundtrip"); c != nil {
+		c.Write(
+			zap.String("dial", address),
+			zap.Object("env", loggableEnv),
+			zap.Object("request", loggableReq),
+		)
+	}
+
+	// connect to the backend
+	dialer := net.Dialer{Timeout: time.Duration(t.DialTimeout)}
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, reverseproxy.NewDialError(fmt.Errorf("dialing backend: %w", err))
+	}
+	defer func() {
+		// conn will be closed with the response body unless there's an error
+		if err != nil {
+			conn.Close()
+		}
+	}()
+
+	// create the client that will facilitate the protocol
+	client := client{
+		rwc:    conn,
+		reqID:  1,
+		logger: logger,
+		stderr: t.CaptureStderr,
+	}
 
 	// read/write timeouts
-	if err := fcgiBackend.SetReadTimeout(time.Duration(t.ReadTimeout)); err != nil {
+	if err = client.SetReadTimeout(time.Duration(t.ReadTimeout)); err != nil {
 		return nil, fmt.Errorf("setting read timeout: %v", err)
 	}
-	if err := fcgiBackend.SetWriteTimeout(time.Duration(t.WriteTimeout)); err != nil {
+	if err = client.SetWriteTimeout(time.Duration(t.WriteTimeout)); err != nil {
 		return nil, fmt.Errorf("setting write timeout: %v", err)
 	}
 
@@ -166,16 +248,19 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	switch r.Method {
 	case http.MethodHead:
-		resp, err = fcgiBackend.Head(env)
+		resp, err = client.Head(env)
 	case http.MethodGet:
-		resp, err = fcgiBackend.Get(env, r.Body, contentLength)
+		resp, err = client.Get(env, r.Body, contentLength)
 	case http.MethodOptions:
-		resp, err = fcgiBackend.Options(env)
+		resp, err = client.Options(env)
 	default:
-		resp, err = fcgiBackend.Post(env, r.Method, r.Header.Get("Content-Type"), r.Body, contentLength)
+		resp, err = client.Post(env, r.Method, r.Header.Get("Content-Type"), r.Body, contentLength)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	return resp, err
+	return resp, nil
 }
 
 // buildEnv returns a set of CGI environment variables for the request.
@@ -198,7 +283,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	ip = strings.Replace(ip, "]", "", 1)
 
 	// make sure file root is absolute
-	root, err := filepath.Abs(repl.ReplaceAll(t.Root, "."))
+	root, err := caddy.FastAbs(repl.ReplaceAll(t.Root, "."))
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +295,15 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		}
 	}
 
-	fpath := r.URL.Path
+	// Derive the script from the same path model the matchers judged: Windows
+	// separators and per-component trailing dots/spaces normalized, then cleaned
+	// (mirroring MatchPath and MatchURLPattern). Caddy does not rewrite
+	// r.URL.Path itself, and the rewrite route php_fastcgi relies on to normalize
+	// it can fail to match, so the transport must establish this invariant rather
+	// than inherit it. Without this, /admin.php/../../other.php (or, on Windows,
+	// /admin.php\..\other.php) is judged by every path matcher as /other.php
+	// while SCRIPT_FILENAME resolves to /admin.php.
+	fpath := caddyhttp.NormalizedPath(r.URL.Path, true)
 	scriptName := fpath
 
 	docURI := fpath
@@ -224,13 +317,32 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		scriptName = strings.TrimSuffix(scriptName, pathInfo)
 	}
 
+	// On Windows, an 8.3 alias or an alternate data stream can name a non-PHP file
+	// with a script-looking path, and path matchers cannot see through either.
+	if runtime.GOOS == "windows" && (strings.Contains(scriptName, ":") || caddyhttp.HasWindowsShortName(scriptName)) {
+		return nil, caddyhttp.Error(http.StatusBadRequest, errors.New("illegal script path"))
+	}
+
+	// Path matchers whose pattern contains "%" clean the escaped path, where "%2f"
+	// and "%2e%2e" are neither separators nor dot segments, so both forms must
+	// select the same script. On Windows, they read a backslash, escaped even
+	// without RawPath, as "%2f".
+	backslash := runtime.GOOS == "windows" && strings.Contains(r.URL.Path, `\`)
+	if r.URL.RawPath != "" || backslash {
+		escaped, err := url.PathUnescape(caddyhttp.NormalizedPath(r.URL.EscapedPath(), true))
+		if backslash {
+			escaped = strings.ReplaceAll(escaped, `\`, "/")
+		}
+		if err != nil || t.scriptPart(escaped) != docURI {
+			return nil, caddyhttp.Error(http.StatusBadRequest, errors.New("escaped and decoded paths select different scripts"))
+		}
+	}
+
 	// Try to grab the path remainder from a file matcher
 	// if we didn't get a split result here.
 	// See https://github.com/caddyserver/caddy/issues/3718
 	if pathInfo == "" {
-		if remainder, ok := repl.GetString("http.matchers.file.remainder"); ok {
-			pathInfo = remainder
-		}
+		pathInfo, _ = repl.GetString("http.matchers.file.remainder")
 	}
 
 	// SCRIPT_FILENAME is the absolute path of SCRIPT_NAME
@@ -260,10 +372,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		reqHost = r.Host
 	}
 
-	authUser := ""
-	if val, ok := repl.Get("http.auth.user.id"); ok {
-		authUser = val.(string)
-	}
+	authUser, _ := repl.GetString("http.auth.user.id")
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
@@ -293,6 +402,18 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		"REQUEST_URI":     origReq.URL.RequestURI(),
 		"SCRIPT_FILENAME": scriptFilename,
 		"SCRIPT_NAME":     scriptName,
+	}
+
+	if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		var ipStr string
+		if host, _, err := net.SplitHostPort(localAddr.String()); err == nil {
+			ipStr = host
+		} else {
+			ipStr = localAddr.String()
+		}
+		if ip := net.ParseIP(ipStr); ip != nil {
+			env["SERVER_ADDR"] = ipStr
+		}
 	}
 
 	// compliance with the CGI specification requires that
@@ -332,22 +453,52 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		}
 	}
 
-	// Add env variables from config (with support for placeholders in values)
-	for key, value := range t.EnvVars {
-		env[key] = repl.ReplaceAll(value, "")
-	}
-
 	// Add all HTTP headers to env variables
 	for field, val := range r.Header {
+		switch http.CanonicalHeaderKey(field) {
+		// HTTP_HOST comes from r.Host, the host the request was routed on:
+		// over HTTP/2, net/http keeps a "host" field distinct from :authority.
+		case "Host":
+			continue
+		// HTTPoxy mitigation: client-supplied Proxy header must not
+		// be trusted for setting the HTTP_PROXY environment variable.
+		// See https://httpoxy.org for details.
+		case "Proxy":
+			continue
+		}
+
 		header := strings.ToUpper(field)
 		header = headerNameReplacer.Replace(header)
 		env["HTTP_"+header] = strings.Join(val, ", ")
 	}
+
+	// Add env variables from config (with support for placeholders in values)
+	// last, so a client header cannot override an HTTP_* variable set by the operator
+	for key, value := range t.EnvVars {
+		env[key] = repl.ReplaceAll(value, "")
+	}
+
 	return env, nil
 }
 
 // splitPos returns the index where path should
 // be split based on t.SplitPath.
+//
+// example: if splitPath is [".php"]
+// "/path/to/script.php/some/path": ("/path/to/script.php", "/some/path")
+//
+// A match must end the path or be followed by "/", as in the file matcher, so
+// "/admin.php.php" or "/admin.phpx/y.php" can't run "/admin.php" past route
+// matchers that judged another file.
+//
+// Matching is strictly ASCII case-insensitive. Bytes >= utf8.RuneSelf in path
+// never match any split entry: split strings are validated ASCII-only and
+// lower-cased in Provision(), so any Unicode equivalence (e.g. fullwidth or
+// mathematical letters folding to ASCII) would let an attacker upload a file
+// whose name contains such code points and have it served as PHP. See
+// FrankenPHP advisories GHSA-3g8v-8r37-cgjm and GHSA-v4h7-cj44-8fc8.
+//
+// Adapted from FrankenPHP's code (copyright 2026 Kévin Dunglas, MIT license)
 func (t Transport) splitPos(path string) int {
 	// TODO: from v1...
 	// if httpserver.CaseSensitivePath {
@@ -357,20 +508,68 @@ func (t Transport) splitPos(path string) int {
 		return 0
 	}
 
-	lowerPath := strings.ToLower(path)
+	pathLen := len(path)
+
 	for _, split := range t.SplitPath {
-		if idx := strings.Index(lowerPath, strings.ToLower(split)); idx > -1 {
-			return idx + len(split)
+		splitLen := len(split)
+		if splitLen == 0 || splitLen > pathLen {
+			continue
+		}
+
+		for i := 0; i <= pathLen-splitLen; i++ {
+			match := true
+			for j := range splitLen {
+				c := path[i+j]
+				if c >= utf8.RuneSelf {
+					match = false
+
+					break
+				}
+
+				if 'A' <= c && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+
+				if c != split[j] {
+					match = false
+
+					break
+				}
+			}
+
+			if end := i + splitLen; match && (end == pathLen || path[end] == '/') {
+				return end
+			}
 		}
 	}
+
 	return -1
 }
 
-// envVars is a simple type to allow for speeding up zap log encoding.
+// scriptPart returns the part of path naming the script.
+func (t Transport) scriptPart(path string) string {
+	if pos := t.splitPos(path); pos > -1 {
+		return path[:pos]
+	}
+	return path
+}
+
 type envVars map[string]string
 
-func (env envVars) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	for k, v := range env {
+// loggableEnv is a simple type to allow for speeding up zap log encoding.
+type loggableEnv struct {
+	vars           envVars
+	logCredentials bool
+}
+
+func (env loggableEnv) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	for k, v := range env.vars {
+		if !env.logCredentials {
+			switch strings.ToLower(k) {
+			case "http_cookie", "http_set_cookie", "http_authorization", "http_proxy_authorization":
+				v = ""
+			}
+		}
 		enc.AddString(k, v)
 	}
 	return nil
@@ -385,12 +584,14 @@ var tlsProtocolStrings = map[uint16]string{
 	tls.VersionTLS13: "TLSv1.3",
 }
 
-var headerNameReplacer = strings.NewReplacer(" ", "_", "-", "_")
+var headerNameReplacer = strings.NewReplacer("-", "_")
 
 // Interface guards
 var (
-	_ zapcore.ObjectMarshaler = (*envVars)(nil)
+	_ zapcore.ObjectMarshaler = (*loggableEnv)(nil)
 
-	_ caddy.Provisioner = (*Transport)(nil)
-	_ http.RoundTripper = (*Transport)(nil)
+	_ caddy.Provisioner                           = (*Transport)(nil)
+	_ http.RoundTripper                           = (*Transport)(nil)
+	_ reverseproxy.BufferedTransport              = (*Transport)(nil)
+	_ reverseproxy.ContentLengthRequiredTransport = (*Transport)(nil)
 )

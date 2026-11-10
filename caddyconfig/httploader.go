@@ -30,8 +30,14 @@ func init() {
 	caddy.RegisterModule(HTTPLoader{})
 }
 
-// HTTPLoader can load Caddy configs over HTTP(S). It can adapt the config
-// based on the Content-Type header of the HTTP response.
+// HTTPLoader can load Caddy configs over HTTP(S).
+//
+// If the response is not a JSON config, a config adapter must be specified
+// either in the loader config (`adapter`), or in the Content-Type HTTP header
+// returned in the HTTP response from the server. The Content-Type header is
+// read just like the admin API's `/load` endpoint. If you don't have control
+// over the HTTP server (but can still trust its response), you can override
+// the Content-Type header by setting the `adapter` property in this config.
 type HTTPLoader struct {
 	// The method for the request. Default: GET
 	Method string `json:"method,omitempty"`
@@ -44,6 +50,11 @@ type HTTPLoader struct {
 
 	// Maximum time allowed for a complete connection and request.
 	Timeout caddy.Duration `json:"timeout,omitempty"`
+
+	// The name of the config adapter to use, if any. Only needed
+	// if the HTTP response is not a JSON config and if the server's
+	// Content-Type header is missing or incorrect.
+	Adapter string `json:"adapter,omitempty"`
 
 	TLS *struct {
 		// Present this instance's managed remote identity credentials to the server.
@@ -84,7 +95,7 @@ func (hl HTTPLoader) LoadConfig(ctx caddy.Context) ([]byte, error) {
 	}
 
 	url := repl.ReplaceAll(hl.URL, "")
-	req, err := http.NewRequest(method, url, nil)
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +105,7 @@ func (hl HTTPLoader) LoadConfig(ctx caddy.Context) ([]byte, error) {
 		}
 	}
 
-	resp, err := client.Do(req)
+	resp, err := doHttpCallWithRetries(ctx, client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -108,15 +119,52 @@ func (hl HTTPLoader) LoadConfig(ctx caddy.Context) ([]byte, error) {
 		return nil, err
 	}
 
-	result, warnings, err := adaptByContentType(resp.Header.Get("Content-Type"), body)
+	// adapt the config based on either manually-configured adapter or server's response header
+	ct := resp.Header.Get("Content-Type")
+	if hl.Adapter != "" {
+		ct = "text/" + hl.Adapter
+	}
+	result, warnings, err := adaptByContentType(ct, body)
 	if err != nil {
 		return nil, err
 	}
 	for _, warn := range warnings {
-		ctx.Logger(hl).Warn(warn.String())
+		ctx.Logger().Warn(warn.String())
 	}
 
 	return result, nil
+}
+
+func attemptHttpCall(client *http.Client, request *http.Request) (*http.Response, error) {
+	resp, err := client.Do(request) //nolint:gosec // no SSRF; comes from trusted config
+	if err != nil {
+		return nil, fmt.Errorf("problem calling http loader url: %v", err)
+	} else if resp.StatusCode < 200 || resp.StatusCode > 499 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("bad response status code from http loader url: %v", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+func doHttpCallWithRetries(ctx caddy.Context, client *http.Client, request *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	const maxAttempts = 10
+
+	for i := range maxAttempts {
+		resp, err = attemptHttpCall(client, request)
+		if err != nil && i < maxAttempts-1 {
+			select {
+			case <-time.After(time.Millisecond * 500):
+			case <-ctx.Done():
+				return resp, ctx.Err()
+			}
+		} else {
+			break
+		}
+	}
+
+	return resp, err
 }
 
 func (hl HTTPLoader) makeClient(ctx caddy.Context) (*http.Client, error) {
@@ -129,23 +177,20 @@ func (hl HTTPLoader) makeClient(ctx caddy.Context) (*http.Client, error) {
 
 		// client authentication
 		if hl.TLS.UseServerIdentity {
-			certs, err := ctx.IdentityCredentials(ctx.Logger(hl))
+			certs, err := ctx.IdentityCredentials(ctx.Logger())
 			if err != nil {
 				return nil, fmt.Errorf("getting server identity credentials: %v", err)
 			}
-			if tlsConfig == nil {
-				tlsConfig = new(tls.Config)
-			}
-			tlsConfig.Certificates = certs
+			// See https://github.com/securego/gosec/issues/1054#issuecomment-2072235199
+			//nolint:gosec
+			tlsConfig = &tls.Config{Certificates: certs}
 		} else if hl.TLS.ClientCertificateFile != "" && hl.TLS.ClientCertificateKeyFile != "" {
 			cert, err := tls.LoadX509KeyPair(hl.TLS.ClientCertificateFile, hl.TLS.ClientCertificateKeyFile)
 			if err != nil {
 				return nil, err
 			}
-			if tlsConfig == nil {
-				tlsConfig = new(tls.Config)
-			}
-			tlsConfig.Certificates = []tls.Certificate{cert}
+			//nolint:gosec
+			tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 		}
 
 		// trusted server certs

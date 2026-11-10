@@ -15,8 +15,22 @@
 package fileserver
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
 )
+
+func TestBrowseOffsetPastEnd(t *testing.T) {
+	listing := browseTemplateContext{Items: []fileInfo{{Name: "a"}, {Name: "b"}}}
+	listing.applySortAndLimit(sortByName, sortOrderAsc, "1", "3")
+	if len(listing.Items) != 0 {
+		t.Errorf("got %d items past the end; want none", len(listing.Items))
+	}
+}
 
 func TestBreadcrumbs(t *testing.T) {
 	testdata := []struct {
@@ -25,6 +39,45 @@ func TestBreadcrumbs(t *testing.T) {
 	}{
 		{"", []crumb{}},
 		{"/", []crumb{{Text: "/"}}},
+		{"/foo/", []crumb{
+			{Link: "../", Text: "/"},
+			{Link: "", Text: "foo"},
+		}},
+		{"/foo/bar/", []crumb{
+			{Link: "../../", Text: "/"},
+			{Link: "../", Text: "foo"},
+			{Link: "", Text: "bar"},
+		}},
+		{"/foo bar/", []crumb{
+			{Link: "../", Text: "/"},
+			{Link: "", Text: "foo bar"},
+		}},
+		{"/foo bar/baz/", []crumb{
+			{Link: "../../", Text: "/"},
+			{Link: "../", Text: "foo bar"},
+			{Link: "", Text: "baz"},
+		}},
+		{"/100%25 test coverage/is a lie/", []crumb{
+			{Link: "../../", Text: "/"},
+			{Link: "../", Text: "100% test coverage"},
+			{Link: "", Text: "is a lie"},
+		}},
+		{"/AC%2FDC/", []crumb{
+			{Link: "../", Text: "/"},
+			{Link: "", Text: "AC/DC"},
+		}},
+		{"/foo/%2e%2e%2f/bar", []crumb{
+			{Link: "../../../", Text: "/"},
+			{Link: "../../", Text: "foo"},
+			{Link: "../", Text: "../"},
+			{Link: "", Text: "bar"},
+		}},
+		{"/foo/../bar", []crumb{
+			{Link: "../../../", Text: "/"},
+			{Link: "../../", Text: "foo"},
+			{Link: "../", Text: ".."},
+			{Link: "", Text: "bar"},
+		}},
 		{"foo/bar/baz", []crumb{
 			{Link: "../../", Text: "foo"},
 			{Link: "../", Text: "bar"},
@@ -51,17 +104,49 @@ func TestBreadcrumbs(t *testing.T) {
 		}},
 	}
 
-	for _, d := range testdata {
+	for testNum, d := range testdata {
 		l := browseTemplateContext{Path: d.path}
 		actual := l.Breadcrumbs()
 		if len(actual) != len(d.expected) {
-			t.Errorf("wrong size output, got %d elements but expected %d", len(actual), len(d.expected))
+			t.Errorf("Test %d: Got %d components but expected %d; got: %+v", testNum, len(actual), len(d.expected), actual)
 			continue
 		}
 		for i, c := range actual {
 			if c != d.expected[i] {
-				t.Errorf("got %#v but expected %#v at index %d", c, d.expected[i], i)
+				t.Errorf("Test %d crumb %d: got %#v but expected %#v at index %d", testNum, i, c, d.expected[i], i)
 			}
+		}
+	}
+}
+
+func TestDirectoryListingSymlinkInEscapedPath(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tc := range []struct {
+		dir     string
+		urlPath string // escaped, as serveBrowse passes it
+	}{
+		{dir: "plain", urlPath: "/plain"},
+		{dir: "with space", urlPath: "/with%20space"},
+		{dir: "ünïcode", urlPath: "/%C3%BCn%C3%AFcode"},
+		{dir: "100%", urlPath: "/100%25"},
+	} {
+		dir := filepath.Join(root, tc.dir)
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, "link")); err != nil {
+			t.Skipf("symlink not supported on this platform: %v", err)
+		}
+
+		fileSystem, entries := readBenchDirEntries(t, dir)
+		listing := benchFileServer().directoryListing(context.Background(), fileSystem, time.Time{}, entries, true, dir, tc.urlPath, caddy.NewReplacer())
+		if len(listing.Items) != 1 || !listing.Items[0].IsDir {
+			t.Errorf("Test %d: expected the symlink in %q to be listed as a directory", i, tc.dir)
 		}
 	}
 }

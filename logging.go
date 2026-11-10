@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/term"
+
+	"github.com/caddyserver/caddy/v2/internal"
 )
 
 func init() {
@@ -62,7 +65,7 @@ type Logging struct {
 	// in dependencies that are not designed specifically for use
 	// in Caddy. Because it is global and unstructured, the sink
 	// lacks most advanced features and customizations.
-	Sink *StandardLibLog `json:"sink,omitempty"`
+	Sink *SinkLog `json:"sink,omitempty"`
 
 	// Logs are your logs, keyed by an arbitrary name of your
 	// choosing. The default log can be customized by defining
@@ -105,7 +108,7 @@ func (logging *Logging) openLogs(ctx Context) error {
 	// then set up any other custom logs
 	for name, l := range logging.Logs {
 		// the default log is already set up
-		if name == "default" {
+		if name == DefaultLoggerName {
 			continue
 		}
 
@@ -138,7 +141,7 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 
 	// extract the user-defined default log, if any
 	newDefault := new(defaultCustomLog)
-	if userDefault, ok := logging.Logs["default"]; ok {
+	if userDefault, ok := logging.Logs[DefaultLoggerName]; ok {
 		newDefault.CustomLog = userDefault
 	} else {
 		// if none, make one with our own default settings
@@ -147,15 +150,23 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 		if err != nil {
 			return fmt.Errorf("setting up default Caddy log: %v", err)
 		}
-		logging.Logs["default"] = newDefault.CustomLog
+		logging.Logs[DefaultLoggerName] = newDefault.CustomLog
 	}
 
-	// set up this new log
-	err := newDefault.CustomLog.provision(ctx, logging)
+	// options for the default logger
+	options, err := newDefault.CustomLog.buildOptions()
 	if err != nil {
 		return fmt.Errorf("setting up default log: %v", err)
 	}
-	newDefault.logger = zap.New(newDefault.CustomLog.core)
+
+	// set up this new log
+	err = newDefault.CustomLog.provision(ctx, logging)
+	if err != nil {
+		return fmt.Errorf("setting up default log: %v", err)
+	}
+
+	filteringCore := &filteringCore{newDefault.CustomLog.core, newDefault.CustomLog}
+	newDefault.logger = zap.New(filteringCore, options...)
 
 	// redirect the default caddy logs
 	defaultLoggerMu.Lock()
@@ -181,6 +192,13 @@ func (logging *Logging) setupNewDefault(ctx Context) error {
 		)
 	}
 
+	// if we had a buffered core, flush its contents ASAP
+	// before we try to log anything else, so the order of
+	// logs is preserved
+	if oldBufferCore, ok := oldDefault.logger.Core().(*internal.LogBufferCore); ok {
+		oldBufferCore.FlushTo(newDefault.logger)
+	}
+
 	return nil
 }
 
@@ -201,6 +219,7 @@ func (logging *Logging) closeLogs() error {
 func (logging *Logging) Logger(mod Module) *zap.Logger {
 	modID := string(mod.CaddyModule().ID)
 	var cores []zapcore.Core
+	var options []zap.Option
 
 	if logging != nil {
 		for _, l := range logging.Logs {
@@ -209,6 +228,13 @@ func (logging *Logging) Logger(mod Module) *zap.Logger {
 					cores = append(cores, l.core)
 					continue
 				}
+				if len(options) == 0 {
+					newOptions, err := l.buildOptions()
+					if err != nil {
+						Log().Error("building options for logger", zap.String("module", modID), zap.Error(err))
+					}
+					options = newOptions
+				}
 				cores = append(cores, &filteringCore{Core: l.core, cl: l})
 			}
 		}
@@ -216,7 +242,7 @@ func (logging *Logging) Logger(mod Module) *zap.Logger {
 
 	multiCore := zapcore.NewTee(cores...)
 
-	return zap.New(multiCore).Named(modID)
+	return zap.New(multiCore, options...).Named(modID)
 }
 
 // openWriter opens a writer using opener, and returns true if
@@ -251,6 +277,17 @@ type WriterOpener interface {
 	OpenWriter() (io.WriteCloser, error)
 }
 
+// IsWriterStandardStream returns true if the input is a
+// writer-opener to a standard stream (stdout, stderr).
+func IsWriterStandardStream(wo WriterOpener) bool {
+	switch wo.(type) {
+	case StdoutWriter, StderrWriter,
+		*StdoutWriter, *StderrWriter:
+		return true
+	}
+	return false
+}
+
 type writerDestructor struct {
 	io.WriteCloser
 }
@@ -259,57 +296,17 @@ func (wdest writerDestructor) Destruct() error {
 	return wdest.Close()
 }
 
-// StandardLibLog configures the default Go standard library
-// global logger in the log package. This is necessary because
-// module dependencies which are not built specifically for
-// Caddy will use the standard logger. This is also known as
-// the "sink" logger.
-type StandardLibLog struct {
+// BaseLog contains the common logging parameters for logging.
+type BaseLog struct {
 	// The module that writes out log entries for the sink.
-	WriterRaw json.RawMessage `json:"writer,omitempty" caddy:"namespace=caddy.logging.writers inline_key=output"`
-
-	writer io.WriteCloser
-}
-
-func (sll *StandardLibLog) provision(ctx Context, logging *Logging) error {
-	if sll.WriterRaw != nil {
-		mod, err := ctx.LoadModule(sll, "WriterRaw")
-		if err != nil {
-			return fmt.Errorf("loading sink log writer module: %v", err)
-		}
-		wo := mod.(WriterOpener)
-
-		var isNew bool
-		sll.writer, isNew, err = logging.openWriter(wo)
-		if err != nil {
-			return fmt.Errorf("opening sink log writer %#v: %v", mod, err)
-		}
-
-		if isNew {
-			log.Printf("[INFO] Redirecting sink to: %s", wo)
-			log.SetOutput(sll.writer)
-			log.Printf("[INFO] Redirected sink to here (%s)", wo)
-		}
-	}
-
-	return nil
-}
-
-// CustomLog represents a custom logger configuration.
-//
-// By default, a log will emit all log entries. Some entries
-// will be skipped if sampling is enabled. Further, the Include
-// and Exclude parameters define which loggers (by name) are
-// allowed or rejected from emitting in this log. If both Include
-// and Exclude are populated, their values must be mutually
-// exclusive, and longer namespaces have priority. If neither
-// are populated, all logs are emitted.
-type CustomLog struct {
-	// The writer defines where log entries are emitted.
 	WriterRaw json.RawMessage `json:"writer,omitempty" caddy:"namespace=caddy.logging.writers inline_key=output"`
 
 	// The encoder is how the log entries are formatted or encoded.
 	EncoderRaw json.RawMessage `json:"encoder,omitempty" caddy:"namespace=caddy.logging.encoders inline_key=format"`
+
+	// Tees entries through a zap.Core module which can extract
+	// log entry metadata and fields for further processing.
+	CoreRaw json.RawMessage `json:"core,omitempty" caddy:"namespace=caddy.logging.cores inline_key=module"`
 
 	// Level is the minimum level to emit, and is inclusive.
 	// Possible levels: DEBUG, INFO, WARN, ERROR, PANIC, and FATAL
@@ -321,15 +318,19 @@ type CustomLog struct {
 	// servers.
 	Sampling *LogSampling `json:"sampling,omitempty"`
 
-	// Include defines the names of loggers to emit in this
-	// log. For example, to include only logs emitted by the
-	// admin API, you would include "admin.api".
-	Include []string `json:"include,omitempty"`
+	// If true, the log entry will include the caller's
+	// file name and line number. Default off.
+	WithCaller bool `json:"with_caller,omitempty"`
 
-	// Exclude defines the names of loggers that should be
-	// skipped by this log. For example, to exclude only
-	// HTTP access logs, you would exclude "http.log.access".
-	Exclude []string `json:"exclude,omitempty"`
+	// If non-zero, and `with_caller` is true, this many
+	// stack frames will be skipped when determining the
+	// caller. Default 0.
+	WithCallerSkip int `json:"with_caller_skip,omitempty"`
+
+	// If not empty, the log entry will include a stack trace
+	// for all logs at the given level or higher. See `level`
+	// for possible values. Default off.
+	WithStacktrace string `json:"with_stacktrace,omitempty"`
 
 	writerOpener WriterOpener
 	writer       io.WriteCloser
@@ -338,63 +339,7 @@ type CustomLog struct {
 	core         zapcore.Core
 }
 
-func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
-	// Replace placeholder for log level
-	repl := NewReplacer()
-	level, err := repl.ReplaceOrErr(cl.Level, true, true)
-	if err != nil {
-		return fmt.Errorf("invalid log level: %v", err)
-	}
-	level = strings.ToLower(level)
-
-	// set up the log level
-	switch level {
-	case "debug":
-		cl.levelEnabler = zapcore.DebugLevel
-	case "", "info":
-		cl.levelEnabler = zapcore.InfoLevel
-	case "warn":
-		cl.levelEnabler = zapcore.WarnLevel
-	case "error":
-		cl.levelEnabler = zapcore.ErrorLevel
-	case "panic":
-		cl.levelEnabler = zapcore.PanicLevel
-	case "fatal":
-		cl.levelEnabler = zapcore.FatalLevel
-	default:
-		return fmt.Errorf("unrecognized log level: %s", cl.Level)
-	}
-
-	// If both Include and Exclude lists are populated, then each item must
-	// be a superspace or subspace of an item in the other list, because
-	// populating both lists means that any given item is either a rule
-	// or an exception to another rule. But if the item is not a super-
-	// or sub-space of any item in the other list, it is neither a rule
-	// nor an exception, and is a contradiction. Ensure, too, that the
-	// sets do not intersect, which is also a contradiction.
-	if len(cl.Include) > 0 && len(cl.Exclude) > 0 {
-		// prevent intersections
-		for _, allow := range cl.Include {
-			for _, deny := range cl.Exclude {
-				if allow == deny {
-					return fmt.Errorf("include and exclude must not intersect, but found %s in both lists", allow)
-				}
-			}
-		}
-
-		// ensure namespaces are nested
-	outer:
-		for _, allow := range cl.Include {
-			for _, deny := range cl.Exclude {
-				if strings.HasPrefix(allow+".", deny+".") ||
-					strings.HasPrefix(deny+".", allow+".") {
-					continue outer
-				}
-			}
-			return fmt.Errorf("when both include and exclude are populated, each element must be a superspace or subspace of one in the other list; check '%s' in include", allow)
-		}
-	}
-
+func (cl *BaseLog) provisionCommon(ctx Context, logging *Logging) error {
 	if cl.WriterRaw != nil {
 		mod, err := ctx.LoadModule(cl, "WriterRaw")
 		if err != nil {
@@ -405,10 +350,16 @@ func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
 	if cl.writerOpener == nil {
 		cl.writerOpener = StderrWriter{}
 	}
-
+	var err error
 	cl.writer, _, err = logging.openWriter(cl.writerOpener)
 	if err != nil {
 		return fmt.Errorf("opening log writer using %#v: %v", cl.writerOpener, err)
+	}
+
+	// set up the log level
+	cl.levelEnabler, err = parseLevel(cl.Level)
+	if err != nil {
+		return err
 	}
 
 	if cl.EncoderRaw != nil {
@@ -417,27 +368,35 @@ func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
 			return fmt.Errorf("loading log encoder module: %v", err)
 		}
 		cl.encoder = mod.(zapcore.Encoder)
+
+		// if the encoder module needs the writer to determine
+		// the correct default to use for a nested encoder, we
+		// pass it down as a secondary provisioning step
+		if cfd, ok := mod.(ConfiguresFormatterDefault); ok {
+			if err := cfd.ConfigureDefaultFormat(cl.writerOpener); err != nil {
+				return fmt.Errorf("configuring default format for encoder module: %v", err)
+			}
+		}
 	}
 	if cl.encoder == nil {
-		// only allow colorized output if this log is going to stdout or stderr
-		var colorize bool
-		switch cl.writerOpener.(type) {
-		case StdoutWriter, StderrWriter,
-			*StdoutWriter, *StderrWriter:
-			colorize = true
-		}
-		cl.encoder = newDefaultProductionLogEncoder(colorize)
+		cl.encoder = newDefaultProductionLogEncoder(cl.writerOpener)
 	}
-
 	cl.buildCore()
-
+	if cl.CoreRaw != nil {
+		mod, err := ctx.LoadModule(cl, "CoreRaw")
+		if err != nil {
+			return fmt.Errorf("loading log core module: %v", err)
+		}
+		core := mod.(zapcore.Core)
+		cl.core = zapcore.NewTee(cl.core, core)
+	}
 	return nil
 }
 
-func (cl *CustomLog) buildCore() {
+func (cl *BaseLog) buildCore() {
 	// logs which only discard their output don't need
 	// to perform encoding or any other processing steps
-	// at all, so just shorcut to a nop core instead
+	// at all, so just shortcut to a nop core instead
 	if _, ok := cl.writerOpener.(*DiscardWriter); ok {
 		cl.core = zapcore.NewNopCore()
 		return
@@ -463,6 +422,106 @@ func (cl *CustomLog) buildCore() {
 	cl.core = c
 }
 
+func (cl *BaseLog) buildOptions() ([]zap.Option, error) {
+	var options []zap.Option
+	if cl.WithCaller {
+		options = append(options, zap.AddCaller())
+		if cl.WithCallerSkip != 0 {
+			options = append(options, zap.AddCallerSkip(cl.WithCallerSkip))
+		}
+	}
+	if cl.WithStacktrace != "" {
+		levelEnabler, err := parseLevel(cl.WithStacktrace)
+		if err != nil {
+			return options, fmt.Errorf("setting up default Caddy log: %v", err)
+		}
+		options = append(options, zap.AddStacktrace(levelEnabler))
+	}
+	return options, nil
+}
+
+// SinkLog configures the default Go standard library
+// global logger in the log package. This is necessary because
+// module dependencies which are not built specifically for
+// Caddy will use the standard logger. This is also known as
+// the "sink" logger.
+type SinkLog struct {
+	BaseLog
+}
+
+func (sll *SinkLog) provision(ctx Context, logging *Logging) error {
+	if err := sll.provisionCommon(ctx, logging); err != nil {
+		return err
+	}
+
+	options, err := sll.buildOptions()
+	if err != nil {
+		return err
+	}
+
+	logger := zap.New(sll.core, options...)
+	ctx.cleanupFuncs = append(ctx.cleanupFuncs, zap.RedirectStdLog(logger))
+	return nil
+}
+
+// CustomLog represents a custom logger configuration.
+//
+// By default, a log will emit all log entries. Some entries
+// will be skipped if sampling is enabled. Further, the Include
+// and Exclude parameters define which loggers (by name) are
+// allowed or rejected from emitting in this log. If both Include
+// and Exclude are populated, their values must be mutually
+// exclusive, and longer namespaces have priority. If neither
+// are populated, all logs are emitted.
+type CustomLog struct {
+	BaseLog
+
+	// Include defines the names of loggers to emit in this
+	// log. For example, to include only logs emitted by the
+	// admin API, you would include "admin.api".
+	Include []string `json:"include,omitempty"`
+
+	// Exclude defines the names of loggers that should be
+	// skipped by this log. For example, to exclude only
+	// HTTP access logs, you would exclude "http.log.access".
+	Exclude []string `json:"exclude,omitempty"`
+}
+
+func (cl *CustomLog) provision(ctx Context, logging *Logging) error {
+	if err := cl.provisionCommon(ctx, logging); err != nil {
+		return err
+	}
+
+	// If both Include and Exclude lists are populated, then each item must
+	// be a superspace or subspace of an item in the other list, because
+	// populating both lists means that any given item is either a rule
+	// or an exception to another rule. But if the item is not a super-
+	// or sub-space of any item in the other list, it is neither a rule
+	// nor an exception, and is a contradiction. Ensure, too, that the
+	// sets do not intersect, which is also a contradiction.
+	if len(cl.Include) > 0 && len(cl.Exclude) > 0 {
+		// prevent intersections
+		for _, allow := range cl.Include {
+			if slices.Contains(cl.Exclude, allow) {
+				return fmt.Errorf("include and exclude must not intersect, but found %s in both lists", allow)
+			}
+		}
+
+		// ensure namespaces are nested
+	outer:
+		for _, allow := range cl.Include {
+			for _, deny := range cl.Exclude {
+				if strings.HasPrefix(allow+".", deny+".") ||
+					strings.HasPrefix(deny+".", allow+".") {
+					continue outer
+				}
+			}
+			return fmt.Errorf("when both include and exclude are populated, each element must be a superspace or subspace of one in the other list; check '%s' in include", allow)
+		}
+	}
+	return nil
+}
+
 func (cl *CustomLog) matchesModule(moduleID string) bool {
 	return cl.loggerAllowed(moduleID, true)
 }
@@ -480,7 +539,7 @@ func (cl *CustomLog) loggerAllowed(name string, isModule bool) bool {
 	// append a dot so that partial names don't match
 	// (i.e. we don't want "foo.b" to match "foo.bar"); we
 	// will also have to append a dot when we do HasPrefix
-	// below to compensate for when when namespaces are equal
+	// below to compensate for when namespaces are equal
 	if name != "" && name != "*" && name != "." {
 		name += "."
 	}
@@ -491,7 +550,12 @@ func (cl *CustomLog) loggerAllowed(name string, isModule bool) bool {
 		for _, namespace := range cl.Include {
 			var hasPrefix bool
 			if isModule {
-				hasPrefix = strings.HasPrefix(namespace+".", name)
+				// the namespace is the module or one of its
+				// sub-loggers (e.g. "http.log.access" for "http")
+				hasPrefix = strings.HasPrefix(namespace+".", name) ||
+					// the namespace is a parent of the module (e.g.
+					// "http.handlers" for "http.handlers.file_server")
+					strings.HasPrefix(name, namespace+".")
 			} else {
 				hasPrefix = strings.HasPrefix(name, namespace+".")
 			}
@@ -656,30 +720,64 @@ func newDefaultProductionLog() (*defaultCustomLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	cl.encoder = newDefaultProductionLogEncoder(true)
+	cl.encoder = newDefaultProductionLogEncoder(cl.writerOpener)
 	cl.levelEnabler = zapcore.InfoLevel
 
 	cl.buildCore()
 
+	logger := zap.New(cl.core)
+
+	// capture logs from other libraries which
+	// may not be using zap logging directly
+	_ = zap.RedirectStdLog(logger)
+
 	return &defaultCustomLog{
 		CustomLog: cl,
-		logger:    zap.New(cl.core),
+		logger:    logger,
 	}, nil
 }
 
-func newDefaultProductionLogEncoder(colorize bool) zapcore.Encoder {
+func newDefaultProductionLogEncoder(wo WriterOpener) zapcore.Encoder {
 	encCfg := zap.NewProductionEncoderConfig()
-	if term.IsTerminal(int(os.Stdout.Fd())) {
+	if IsWriterStandardStream(wo) && term.IsTerminal(int(os.Stderr.Fd())) {
 		// if interactive terminal, make output more human-readable by default
 		encCfg.EncodeTime = func(ts time.Time, encoder zapcore.PrimitiveArrayEncoder) {
 			encoder.AppendString(ts.UTC().Format("2006/01/02 15:04:05.000"))
 		}
-		if colorize {
+		if coloringEnabled {
 			encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
 		}
+
 		return zapcore.NewConsoleEncoder(encCfg)
 	}
 	return zapcore.NewJSONEncoder(encCfg)
+}
+
+func parseLevel(levelInput string) (zapcore.LevelEnabler, error) {
+	repl := NewReplacer()
+	level, err := repl.ReplaceOrErr(levelInput, true, true)
+	if err != nil {
+		return nil, fmt.Errorf("invalid log level: %v", err)
+	}
+	level = strings.ToLower(level)
+
+	// set up the log level
+	switch level {
+	case "debug":
+		return zapcore.DebugLevel, nil
+	case "", "info":
+		return zapcore.InfoLevel, nil
+	case "warn":
+		return zapcore.WarnLevel, nil
+	case "error":
+		return zapcore.ErrorLevel, nil
+	case "panic":
+		return zapcore.PanicLevel, nil
+	case "fatal":
+		return zapcore.FatalLevel, nil
+	default:
+		return nil, fmt.Errorf("unrecognized log level: %s", level)
+	}
 }
 
 // Log returns the current default logger.
@@ -689,12 +787,52 @@ func Log() *zap.Logger {
 	return defaultLogger.logger
 }
 
+// BufferedLog sets the default logger to one that buffers
+// logs before a config is loaded.
+// Returns the buffered logger, the original default logger
+// (for flushing on errors), and the buffer core so that the
+// caller can flush the logs after the config is loaded or
+// fails to load.
+func BufferedLog() (*zap.Logger, *zap.Logger, *internal.LogBufferCore) {
+	defaultLoggerMu.Lock()
+	defer defaultLoggerMu.Unlock()
+	origLogger := defaultLogger.logger
+	bufferCore := internal.NewLogBufferCore(zap.InfoLevel)
+	defaultLogger.logger = zap.New(bufferCore)
+	return defaultLogger.logger, origLogger, bufferCore
+}
+
+// UnbufferDefaultLogger restores the default logger's underlying zap.Logger to orig
+// if the default logger is still pointing to a buffer core, flushing any remaining buffered logs.
+func UnbufferDefaultLogger(orig *zap.Logger) {
+	defaultLoggerMu.Lock()
+	defer defaultLoggerMu.Unlock()
+	if defaultLogger != nil && defaultLogger.logger != nil {
+		if bufferCore, ok := defaultLogger.logger.Core().(*internal.LogBufferCore); ok {
+			bufferCore.FlushTo(orig)
+			defaultLogger.logger = orig
+		}
+	}
+}
+
 var (
+	coloringEnabled  = os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "xterm-mono"
 	defaultLogger, _ = newDefaultProductionLog()
 	defaultLoggerMu  sync.RWMutex
 )
 
 var writers = NewUsagePool()
+
+// ConfiguresFormatterDefault is an optional interface that
+// encoder modules can implement to configure the default
+// format of their encoder. This is useful for encoders
+// which nest an encoder, that needs to know the writer
+// in order to determine the correct default.
+type ConfiguresFormatterDefault interface {
+	ConfigureDefaultFormat(WriterOpener) error
+}
+
+const DefaultLoggerName = "default"
 
 // Interface guards
 var (

@@ -19,36 +19,24 @@ import (
 	"fmt"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/warning"
 )
 
 // Adapter is a type which can adapt a configuration to Caddy JSON.
 // It returns the results and any warnings, or an error.
 type Adapter interface {
-	Adapt(body []byte, options map[string]interface{}) ([]byte, []Warning, error)
+	Adapt(body []byte, options map[string]any) ([]byte, []Warning, error)
 }
 
 // Warning represents a warning or notice related to conversion.
-type Warning struct {
-	File      string `json:"file,omitempty"`
-	Line      int    `json:"line,omitempty"`
-	Directive string `json:"directive,omitempty"`
-	Message   string `json:"message,omitempty"`
-}
-
-func (w Warning) String() string {
-	var directive string
-	if w.Directive != "" {
-		directive = fmt.Sprintf(" (%s)", w.Directive)
-	}
-	return fmt.Sprintf("%s:%d%s: %s", w.File, w.Line, directive, w.Message)
-}
+type Warning = warning.Warning
 
 // JSON encodes val as JSON, returning it as a json.RawMessage. Any
 // marshaling errors (which are highly unlikely with correct code)
 // are converted to warnings. This is convenient when filling config
 // structs that require a json.RawMessage, without having to worry
 // about errors.
-func JSON(val interface{}, warnings *[]Warning) json.RawMessage {
+func JSON(val any, warnings *[]Warning) json.RawMessage {
 	b, err := json.Marshal(val)
 	if err != nil {
 		if warnings != nil {
@@ -64,9 +52,9 @@ func JSON(val interface{}, warnings *[]Warning) json.RawMessage {
 // for encoding module values where the module name has to be described within
 // the object by a certain key; for example, `"handler": "file_server"` for a
 // file server HTTP handler (fieldName="handler" and fieldVal="file_server").
-// The val parameter must encode into a map[string]interface{} (i.e. it must be
+// The val parameter must encode into a map[string]any (i.e. it must be
 // a struct or map). Any errors are converted into warnings.
-func JSONModuleObject(val interface{}, fieldName, fieldVal string, warnings *[]Warning) json.RawMessage {
+func JSONModuleObject(val any, fieldName, fieldVal string, warnings *[]Warning) json.RawMessage {
 	// encode to a JSON object first
 	enc, err := json.Marshal(val)
 	if err != nil {
@@ -77,11 +65,15 @@ func JSONModuleObject(val interface{}, fieldName, fieldVal string, warnings *[]W
 	}
 
 	// then decode the object
-	var tmp map[string]interface{}
+	var tmp map[string]any
 	err = json.Unmarshal(enc, &tmp)
 	if err != nil {
 		if warnings != nil {
-			*warnings = append(*warnings, Warning{Message: err.Error()})
+			message := err.Error()
+			if jsonErr, ok := err.(*json.SyntaxError); ok {
+				message = fmt.Sprintf("%v, at offset %d", jsonErr.Error(), jsonErr.Offset)
+			}
+			*warnings = append(*warnings, Warning{Message: message})
 		}
 		return nil
 	}

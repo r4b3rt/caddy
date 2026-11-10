@@ -19,18 +19,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	weakrand "math/rand"
+	weakrand "math/rand/v2"
 	"net/http"
+	"slices"
+	"strings"
 	"sync"
-	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
 	caddy.RegisterModule(HTTPBasicAuth{})
-
-	weakrand.Seed(time.Now().UnixNano())
 }
 
 // HTTPBasicAuth facilitates HTTP basic authentication.
@@ -94,10 +95,7 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 
 	// if supported, generate a fake password we can compare against if needed
 	if hasher, ok := hba.Hash.(Hasher); ok {
-		hba.fakePassword, err = hasher.Hash([]byte("antitiming"), []byte("fakesalt"))
-		if err != nil {
-			return fmt.Errorf("generating anti-timing password hash: %v", err)
-		}
+		hba.fakePassword = hasher.FakeHash()
 	}
 
 	repl := caddy.NewReplacer()
@@ -105,26 +103,27 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 	// load account list
 	hba.Accounts = make(map[string]Account)
 	for i, acct := range hba.AccountList {
+		acct.Username = repl.ReplaceKnown(acct.Username, "")
+		acct.Password = repl.ReplaceKnown(acct.Password, "")
+
 		if _, ok := hba.Accounts[acct.Username]; ok {
 			return fmt.Errorf("account %d: username is not unique: %s", i, acct.Username)
 		}
-
-		acct.Username = repl.ReplaceAll(acct.Username, "")
-		acct.Password = repl.ReplaceAll(acct.Password, "")
-		acct.Salt = repl.ReplaceAll(acct.Salt, "")
 
 		if acct.Username == "" || acct.Password == "" {
 			return fmt.Errorf("account %d: username and password are required", i)
 		}
 
-		acct.password, err = base64.StdEncoding.DecodeString(acct.Password)
-		if err != nil {
-			return fmt.Errorf("base64-decoding password: %v", err)
-		}
-		if acct.Salt != "" {
-			acct.salt, err = base64.StdEncoding.DecodeString(acct.Salt)
+		// TODO: Remove support for redundantly-encoded b64-encoded hashes
+		// Passwords starting with '$' are likely in Modular Crypt Format,
+		// so we don't need to base64 decode them. But historically, we
+		// required redundant base64, so we try to decode it otherwise.
+		if strings.HasPrefix(acct.Password, "$") {
+			acct.password = []byte(acct.Password)
+		} else {
+			acct.password, err = base64.StdEncoding.DecodeString(acct.Password)
 			if err != nil {
-				return fmt.Errorf("base64-decoding salt: %v", err)
+				return fmt.Errorf("base64-decoding password: %v", err)
 			}
 		}
 
@@ -135,6 +134,7 @@ func (hba *HTTPBasicAuth) Provision(ctx caddy.Context) error {
 	if hba.HashCache != nil {
 		hba.HashCache.cache = make(map[string]bool)
 		hba.HashCache.mu = new(sync.RWMutex)
+		hba.HashCache.g = new(singleflight.Group)
 	}
 
 	return nil
@@ -165,7 +165,7 @@ func (hba HTTPBasicAuth) Authenticate(w http.ResponseWriter, req *http.Request) 
 
 func (hba HTTPBasicAuth) correctPassword(account Account, plaintextPassword []byte) (bool, error) {
 	compare := func() (bool, error) {
-		return hba.Hash.Compare(account.password, plaintextPassword, account.salt)
+		return hba.Hash.Compare(account.password, plaintextPassword)
 	}
 
 	// if no caching is enabled, simply return the result of hashing + comparing
@@ -174,7 +174,9 @@ func (hba HTTPBasicAuth) correctPassword(account Account, plaintextPassword []by
 	}
 
 	// compute a cache key that is unique for these input parameters
-	cacheKey := hex.EncodeToString(append(append(account.password, account.salt...), plaintextPassword...))
+	// (build it in a new buffer: appending to account.password could write
+	// into its spare capacity, which is shared by all concurrent requests)
+	cacheKey := hex.EncodeToString(slices.Concat(account.password, plaintextPassword))
 
 	// fast track: if the result of the input is already cached, use it
 	hba.HashCache.mu.RLock()
@@ -183,12 +185,18 @@ func (hba HTTPBasicAuth) correctPassword(account Account, plaintextPassword []by
 	if ok {
 		return same, nil
 	}
-
 	// slow track: do the expensive op, then add it to the cache
-	same, err := compare()
+	// but perform it in a singleflight group so that multiple
+	// parallel requests using the same password don't cause a
+	// thundering herd problem by all performing the same hashing
+	// operation before the first one finishes and caches it.
+	v, err, _ := hba.HashCache.g.Do(cacheKey, func() (any, error) {
+		return compare()
+	})
 	if err != nil {
 		return false, err
 	}
+	same = v.(bool)
 	hba.HashCache.mu.Lock()
 	if len(hba.HashCache.cache) >= 1000 {
 		hba.HashCache.makeRoom() // keep cache size under control
@@ -207,7 +215,7 @@ func (hba HTTPBasicAuth) promptForCredentials(w http.ResponseWriter, err error) 
 	if realm == "" {
 		realm = "restricted"
 	}
-	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+	w.Header().Set("Www-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
 	return User{}, false, err
 }
 
@@ -216,8 +224,9 @@ func (hba HTTPBasicAuth) promptForCredentials(w http.ResponseWriter, err error) 
 // compute on every HTTP request.
 type Cache struct {
 	mu *sync.RWMutex
+	g  *singleflight.Group
 
-	// map of concatenated hashed password + plaintext password + salt, to result
+	// map of concatenated hashed password + plaintext password, to result
 	cache map[string]bool
 }
 
@@ -230,10 +239,7 @@ func (c *Cache) makeRoom() {
 	// the cache is on a long tail, we can save a lot of CPU
 	// time by doing a whole bunch of deletions now and then
 	// we won't have to do them again for a while
-	numToDelete := len(c.cache) / 10
-	if numToDelete < 1 {
-		numToDelete = 1
-	}
+	numToDelete := max(len(c.cache)/10, 1)
 	for deleted := 0; deleted <= numToDelete; deleted++ {
 		// Go maps are "nondeterministic" not actually random,
 		// so although we could just chop off the "front" of the
@@ -241,7 +247,7 @@ func (c *Cache) makeRoom() {
 		// strategy; generating random numbers is cheap and
 		// ensures a much better distribution.
 		//nolint:gosec
-		rnd := weakrand.Intn(len(c.cache))
+		rnd := weakrand.IntN(len(c.cache))
 		i := 0
 		for key := range c.cache {
 			if i == rnd {
@@ -260,35 +266,52 @@ func (c *Cache) makeRoom() {
 // comparison.
 type Comparer interface {
 	// Compare returns true if the result of hashing
-	// plaintextPassword with salt is hashedPassword,
-	// false otherwise. An error is returned only if
+	// plaintextPassword is hashedPassword, false
+	// otherwise. An error is returned only if
 	// there is a technical/configuration error.
-	Compare(hashedPassword, plaintextPassword, salt []byte) (bool, error)
+	Compare(hashedPassword, plaintextPassword []byte) (bool, error)
 }
 
 // Hasher is a type that can generate a secure hash
-// given a plaintext and optional salt (for algorithms
-// that require a salt). Hashing modules which implement
+// given a plaintext. Hashing modules which implement
 // this interface can be used with the hash-password
 // subcommand as well as benefitting from anti-timing
-// features.
+// features. A hasher also returns a fake hash which
+// can be used for timing side-channel mitigation.
 type Hasher interface {
-	Hash(plaintext, salt []byte) ([]byte, error)
+	Hash(plaintext []byte) ([]byte, error)
+	FakeHash() []byte
 }
 
-// Account contains a username, password, and salt (if applicable).
+// hashesNamespace is the module namespace of password hashing modules.
+const hashesNamespace = "http.authentication.hashes"
+
+// hashModuleInfo returns the module info of the installed password
+// hashing module with the given name (e.g. "bcrypt"). If no such module
+// is installed, the returned error lists the available algorithms.
+func hashModuleInfo(name string) (caddy.ModuleInfo, error) {
+	mods := caddy.GetModules(hashesNamespace)
+	names := make([]string, 0, len(mods))
+	for _, mod := range mods {
+		if mod.ID.Name() == name {
+			return mod, nil
+		}
+		names = append(names, mod.ID.Name())
+	}
+	return caddy.ModuleInfo{}, fmt.Errorf("unrecognized hash algorithm: %s (available: %s)",
+		name, strings.Join(names, ", "))
+}
+
+// Account contains a username and password.
 type Account struct {
 	// A user's username.
 	Username string `json:"username"`
 
-	// The user's hashed password, base64-encoded.
-	Password string `json:"password"`
+	// The user's hashed password, in Modular Crypt Format (with `$` prefix)
+	// or base64-encoded.
+	Password string `json:"password"` //nolint:gosec // false positive, this is a hashed password
 
-	// The user's password salt, base64-encoded; for
-	// algorithms where external salt is needed.
-	Salt string `json:"salt,omitempty"`
-
-	password, salt []byte
+	password []byte
 }
 
 // Interface guards

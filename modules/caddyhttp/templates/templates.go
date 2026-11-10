@@ -21,6 +21,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"text/template"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -33,17 +36,29 @@ func init() {
 // Templates is a middleware which executes response bodies as Go templates.
 // The syntax is documented in the Go standard library's
 // [text/template package](https://golang.org/pkg/text/template/).
+// Note that ANY response body that matches and qualifies may be evaluated,
+// even if it comes from a proxied backend.
 //
-// ⚠️ Template functions/actions are still experimental, so they are subject to change.
+// ⚠️ Template functions/actions can access the environment, files on disk,
+// and make HTTP requests. This is extremely useful, but you need to make
+// sure templates are only evaluated on content that you trust, control, or
+// at least sanitize properly.
+//
+// ⚠️ Templates are still experimental, so they are subject to change.
 //
 // [All Sprig functions](https://masterminds.github.io/sprig/) are supported.
+//
+// Custom template functions can be registered by creating a plugin module
+// under the `http.handlers.templates.functions.*` namespace that implements
+// the `CustomFunctions` interface.
 //
 // In addition to the standard functions and the Sprig library, Caddy adds
 // extra functions and data that are available to a template:
 //
 // ##### `.Args`
 //
-// A slice of arguments passed to this page/context, for example as the result of a `include`.
+// A slice of arguments passed to this page/context, for example
+// as the result of a [`include`](#include).
 //
 // ```
 // {{index .Args 0}} // first argument
@@ -75,6 +90,12 @@ func init() {
 // {{placeholder "http.error.status_code"}}
 // ```
 //
+// As a shortcut, `ph` is an alias for `placeholder`.
+//
+// ```
+// {{ph "http.request.method"}}
+// ```
+//
 // ##### `.Host`
 //
 // Returns the hostname portion (no port) of the Host header of the HTTP request.
@@ -85,7 +106,11 @@ func init() {
 //
 // ##### `httpInclude`
 //
-// Includes the contents of another file by making a virtual HTTP request (also known as a sub-request). The URI path must exist on the same virtual server because the request does not use sockets; instead, the request is crafted in memory and the handler is invoked directly for increased efficiency.
+// Includes the contents of another file, and renders it in-place,
+// by making a virtual HTTP request (also known as a sub-request).
+// The URI path must exist on the same virtual server because the
+// request does not use sockets; instead, the request is crafted in
+// memory and the handler is invoked directly for increased efficiency.
 //
 // ```
 // {{httpInclude "/foo/bar?q=val"}}
@@ -93,43 +118,84 @@ func init() {
 //
 // ##### `import`
 //
-// Imports the contents of another file and adds any template definitions to the template stack. If there are no defitions, the filepath will be the defition name. Any {{ define }} blocks will be accessible by {{ template }} or {{ block }}. Imports must happen before the template or block action is called
+// Reads and returns the contents of another file, and parses it
+// as a template, adding any template definitions to the template
+// stack. If there are no definitions, the filepath will be the
+// definition name. Any `{{ define }}` blocks will be accessible by
+// `{{ template }}` or `{{ block }}`. Imports must happen before the
+// template or block action is called. Note that the contents are
+// NOT escaped, so you should only import trusted template files.
 //
 // **filename.html**
 // ```
 // {{ define "main" }}
 // content
 // {{ end }}
+// ```
 //
 // **index.html**
 // ```
-// {{ import "/path/to/file.html" }}
+// {{ import "/path/to/filename.html" }}
 // {{ template "main" }}
 // ```
 //
 // ##### `include`
 //
-// Includes the contents of another file and renders in-place. Optionally can pass key-value pairs as arguments to be accessed by the included file.
+// Includes the contents of another file, rendering it in-place.
+// Optionally can pass key-value pairs as arguments to be accessed
+// by the included file. Use [`.Args N`](#args) to access the N-th
+// argument, 0-indexed. Note that the contents are NOT escaped, so
+// you should only include trusted template files.
 //
 // ```
 // {{include "path/to/file.html"}}  // no arguments
-// {{include "path/to/file.html" "arg1" 2 "value 3"}}  // with arguments
+// {{include "path/to/file.html" "arg0" 1 "value 2"}}  // with arguments
+// ```
+//
+// ##### `readFile`
+//
+// Reads and returns the contents of another file, as-is.
+// Note that the contents are NOT escaped, so you should
+// only read trusted files.
+//
+// ```
+// {{readFile "path/to/file.html"}}
 // ```
 //
 // ##### `listFiles`
 //
-// Returns a list of the files in the given directory, which is relative to the template context's file root.
+// Returns a list of the files in the given directory, which is relative
+// to the template context's file root.
 //
 // ```
 // {{listFiles "/mydir"}}
 // ```
 //
+// ##### `fileExists`
+//
+// Returns true if the given file name, relative to the template context's file root,
+// can be opened successfully.
+//
+// ```
+// {{fileExists "path/to/file.html"}}
+// ```
+//
+// ##### `fileStat`
+//
+// Returns [FileInfo](https://pkg.go.dev/io/fs#FileInfo) using [Stat](https://pkg.go.dev/io/fs#Stat)
+// on the given file name, relative to the template context's file root.
+//
+// ```
+// {{$css := fileStat "css/style.css" -}}
+// <link rel="stylesheet" href="/css/style.css?v={{ $css.ModTime.Unix }}">
+// ```
+//
 // ##### `markdown`
 //
-// Renders the given Markdown text as HTML. This uses the
+// Renders the given Markdown text as HTML and returns it. This uses the
 // [Goldmark](https://github.com/yuin/goldmark) library,
-// which is CommonMark compliant. It also has these plugins
-// enabled: Github Flavored Markdown, Footnote and syntax
+// which is CommonMark compliant. It also has these extensions
+// enabled: GitHub Flavored Markdown, Footnote, and syntax
 // highlighting provided by [Chroma](https://github.com/alecthomas/chroma).
 //
 // ```
@@ -138,20 +204,29 @@ func init() {
 //
 // ##### `.RemoteIP`
 //
-// Returns the client's IP address.
+// Returns the connection's IP address.
 //
 // ```
 // {{.RemoteIP}}
+// ```
+//
+// ##### `.ClientIP`
+//
+// Returns the real client's IP address, if `trusted_proxies` was configured,
+// otherwise returns the connection's IP address.
+//
+// ```
+// {{.ClientIP}}
 // ```
 //
 // ##### `.Req`
 //
 // Accesses the current HTTP request, which has various fields, including:
 //
-//    - `.Method` - the method
-//    - `.URL` - the URL, which in turn has component fields (Scheme, Host, Path, etc.)
-//    - `.Header` - the header fields
-//    - `.Host` - the Host or :authority header of the request
+//   - `.Method` - the method
+//   - `.URL` - the URL, which in turn has component fields (Scheme, Host, Path, etc.)
+//   - `.Header` - the header fields
+//   - `.Host` - the Host or :authority header of the request
 //
 // ```
 // {{.Req.Header.Get "User-Agent"}}
@@ -159,7 +234,8 @@ func init() {
 //
 // ##### `.OriginalReq`
 //
-// Like .Req, except it accesses the original HTTP request before rewrites or other internal modifications.
+// Like [`.Req`](#req), except it accesses the original HTTP
+// request before rewrites or other internal modifications.
 //
 // ##### `.RespHeader.Add`
 //
@@ -185,13 +261,23 @@ func init() {
 // {{.RespHeader.Set "Field-Name" "val"}}
 // ```
 //
+// ##### `httpError`
+//
+// Returns an error with the given status code to the HTTP handler chain.
+//
+// ```
+// {{if not (fileExists $includedFile)}}{{httpError 404}}{{end}}
+// ```
+//
 // ##### `splitFrontMatter`
 //
-// Splits front matter out from the body. Front matter is metadata that appears at the very beginning of a file or string. Front matter can be in YAML, TOML, or JSON formats:
+// Splits front matter out from the body. Front matter is metadata that
+// appears at the very beginning of a file or string. Front matter can
+// be in YAML, TOML, or JSON formats:
 //
 // **TOML** front matter starts and ends with `+++`:
 //
-// ```
+// ```toml
 // +++
 // template = "blog"
 // title = "Blog Homepage"
@@ -201,7 +287,7 @@ func init() {
 //
 // **YAML** is surrounded by `---`:
 //
-// ```
+// ```yaml
 // ---
 // template: blog
 // title: Blog Homepage
@@ -209,14 +295,13 @@ func init() {
 // ---
 // ```
 //
-//
 // **JSON** is simply `{` and `}`:
 //
-// ```
+// ```json
 // {
-// 	"template": "blog",
-// 	"title": "Blog Homepage",
-// 	"sitename": "A Caddy site"
+// "template": "blog",
+// "title": "Blog Homepage",
+// "sitename": "A Caddy site"
 // }
 // ```
 //
@@ -224,7 +309,6 @@ func init() {
 //
 // - `.Meta` to access the metadata fields, for example: `{{$parsed.Meta.title}}`
 // - `.Body` to access the body after the front matter, for example: `{{markdown $parsed.Body}}`
-//
 //
 // ##### `stripHTML`
 //
@@ -234,6 +318,58 @@ func init() {
 // {{stripHTML "Shows <b>only</b> text content"}}
 // ```
 //
+// ##### `humanize`
+//
+// Transforms size and time inputs to a human readable format.
+// This uses the [go-humanize](https://github.com/dustin/go-humanize) library.
+//
+// The first argument must be a format type, and the last argument
+// is the input, or the input can be piped in. The supported format
+// types are:
+// - **size** which turns an integer amount of bytes into a string like `2.3 MB`
+// - **time** which turns a time string into a relative time string like `2 weeks ago`
+//
+// For the `time` format, the layout for parsing the input can be configured
+// by appending a colon `:` followed by the desired time layout. You can
+// find the documentation on time layouts [in Go's docs](https://pkg.go.dev/time#pkg-constants).
+// The default time layout is `RFC1123Z`, i.e. `Mon, 02 Jan 2006 15:04:05 -0700`.
+//
+// ```
+// {{humanize "size" "2048000"}}
+// {{placeholder "http.response.header.Content-Length" | humanize "size"}}
+// {{humanize "time" "Fri, 05 May 2022 15:04:05 +0200"}}
+// {{humanize "time:2006-Jan-02" "2022-May-05"}}
+// ```
+//
+// ##### `pathEscape`
+//
+// Passes a string through `url.PathEscape`, replacing characters that have
+// special meaning in URL path parameters (`?`, `&`, `%`).
+//
+// Useful e.g. to include filenames containing these characters in URL path
+// parameters, or use them as an `img` element's `src` attribute.
+//
+// ```
+// {{pathEscape "50%_valid_filename?.jpg"}}
+// ```
+//
+// ##### `maybe`
+//
+// Invokes a custom template function only if it is registered (plugged-in)
+// in the `http.handlers.templates.functions.*` namespace.
+//
+// The first argument is the function name, and any subsequent arguments
+// are forwarded to that function. If the named function is not available,
+// the invocation is ignored and a log message is emitted.
+//
+// This is useful for templates that optionally use components which may
+// not be present in every build or environment.
+//
+// NOTE: This function is EXPERIMENTAL and subject to change or removal.
+//
+// ```
+// {{ maybe "myOptionalFunc" "arg1" 2 }}
+// ```
 type Templates struct {
 	// The root path from which to load files. Required if template functions
 	// accessing the file system are used (such as include). Default is
@@ -248,6 +384,19 @@ type Templates struct {
 	// The template action delimiters. If set, must be precisely two elements:
 	// the opening and closing delimiters. Default: `["{{", "}}"]`
 	Delimiters []string `json:"delimiters,omitempty"`
+
+	// Extensions adds functions to the template's func map. These often
+	// act as components on web pages, for example.
+	ExtensionsRaw caddy.ModuleMap `json:"match,omitempty" caddy:"namespace=http.handlers.templates.functions"`
+
+	customFuncs []template.FuncMap
+	logger      *zap.Logger
+}
+
+// CustomFunctions is the interface for registering custom template functions.
+type CustomFunctions interface {
+	// CustomTemplateFunctions should return the mapping from custom function names to implementations.
+	CustomTemplateFunctions() template.FuncMap
 }
 
 // CaddyModule returns the Caddy module information.
@@ -260,6 +409,15 @@ func (Templates) CaddyModule() caddy.ModuleInfo {
 
 // Provision provisions t.
 func (t *Templates) Provision(ctx caddy.Context) error {
+	t.logger = ctx.Logger()
+	mods, err := ctx.LoadModule(t, "ExtensionsRaw")
+	if err != nil {
+		return fmt.Errorf("loading template extensions: %v", err)
+	}
+	for _, modIface := range mods.(map[string]any) {
+		t.customFuncs = append(t.customFuncs, modIface.(CustomFunctions).CustomTemplateFunctions())
+	}
+
 	if t.MIMETypes == nil {
 		t.MIMETypes = defaultMIMETypes
 	}
@@ -309,7 +467,16 @@ func (t *Templates) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		return err
 	}
 
-	rec.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	// responses without a body (HEAD, 1xx, 204, 304) can't tell us the
+	// length of the rendered template, so drop the header rather than
+	// advertising the length of the empty buffer, and a 2xx response to
+	// CONNECT must not have one at all (RFC 9110 §8.6)
+	connectSuccess := r.Method == http.MethodConnect && rec.Status() >= 200 && rec.Status() <= 299
+	if r.Method == http.MethodHead || connectSuccess || !bodyAllowedForStatus(rec.Status()) {
+		rec.Header().Del("Content-Length")
+	} else {
+		rec.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	}
 	rec.Header().Del("Accept-Ranges") // we don't know ranges for dynamically-created content
 	rec.Header().Del("Last-Modified") // useless for dynamic content since it's always changing
 
@@ -321,6 +488,20 @@ func (t *Templates) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	return rec.WriteResponse()
 }
 
+// bodyAllowedForStatus reports whether a response with the given
+// status may include a body, per RFC 9110 §6.4.1.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+
 // executeTemplate executes the template contained in wb.buf and replaces it with the results.
 func (t *Templates) executeTemplate(rr caddyhttp.ResponseRecorder, r *http.Request) error {
 	var fs http.FileSystem
@@ -330,18 +511,28 @@ func (t *Templates) executeTemplate(rr caddyhttp.ResponseRecorder, r *http.Reque
 	}
 
 	ctx := &TemplateContext{
-		Root:       fs,
-		Req:        r,
-		RespHeader: WrappedHeader{rr.Header()},
-		config:     t,
+		Root:        fs,
+		Req:         r,
+		RespHeader:  WrappedHeader{rr.Header()},
+		config:      t,
+		CustomFuncs: t.customFuncs,
 	}
 
 	err := ctx.executeTemplateInBuffer(r.URL.Path, rr.Buffer())
 	if err != nil {
+		// Delete some headers that may have been set by the underlying
+		// handler (such as file_server) which may break the error response.
+		rr.Header().Del("Content-Length")
+		rr.Header().Del("Content-Type")
+		rr.Header().Del("Etag")
+		rr.Header().Del("Last-Modified")
+		rr.Header().Del("Accept-Ranges")
+		rr.Header().Del("Content-Encoding")
+		rr.Header().Del("Content-Range")
+
 		// templates may return a custom HTTP error to be propagated to the client,
 		// otherwise for any other error we assume the template is broken
-		var handlerErr caddyhttp.HandlerError
-		if errors.As(err, &handlerErr) {
+		if handlerErr, ok := errors.AsType[caddyhttp.HandlerError](err); ok {
 			return handlerErr
 		}
 		return caddyhttp.Error(http.StatusInternalServerError, err)

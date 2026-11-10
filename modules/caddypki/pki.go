@@ -17,8 +17,9 @@ package caddypki
 import (
 	"fmt"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
@@ -54,7 +55,7 @@ func (PKI) CaddyModule() caddy.ModuleInfo {
 // Provision sets up the configuration for the PKI app.
 func (p *PKI) Provision(ctx caddy.Context) error {
 	p.ctx = ctx
-	p.log = ctx.Logger(p)
+	p.log = ctx.Logger()
 
 	for caID, ca := range p.CAs {
 		err := ca.Provision(ctx, caID, p.log)
@@ -108,8 +109,10 @@ func (p *PKI) Start() error {
 	// see if root/intermediates need renewal...
 	p.renewCerts()
 
-	// ...and keep them renewed
-	go p.maintenance()
+	// ...and keep them renewed (one goroutine per CA with its own interval)
+	for _, ca := range p.CAs {
+		go p.maintenanceForCA(ca)
+	}
 
 	return nil
 }

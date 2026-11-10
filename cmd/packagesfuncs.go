@@ -22,13 +22,15 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func cmdUpgrade(fl Flags) (int, error) {
@@ -42,6 +44,33 @@ func cmdUpgrade(fl Flags) (int, error) {
 	}
 
 	return upgradeBuild(pluginPkgs, fl)
+}
+
+func splitModule(arg string) (module, version string, err error) {
+	const versionSplit = "@"
+
+	// Per https://go.dev/ref/mod#go-mod-file-ident, module paths consist of
+	// ASCII letters, digits, and `-`, `.`, `_`, `~` only, so `@` is never a
+	// valid path character. That makes the split unambiguous: at most one
+	// `@` may appear, and it separates the module path from the version.
+	switch strings.Count(arg, versionSplit) {
+	case 0:
+		module = arg
+	case 1:
+		idx := strings.Index(arg, versionSplit)
+		module, version = arg[:idx], arg[idx+1:]
+		if version == "" {
+			return "", "", fmt.Errorf("version is required after '@'")
+		}
+	default:
+		return "", "", fmt.Errorf("module path must not contain '@'")
+	}
+
+	if module == "" {
+		return "", "", fmt.Errorf("module name is required")
+	}
+
+	return module, version, nil
 }
 
 func cmdAddPackage(fl Flags) (int, error) {
@@ -58,10 +87,15 @@ func cmdAddPackage(fl Flags) (int, error) {
 	}
 
 	for _, arg := range fl.Args() {
-		if _, ok := pluginPkgs[arg]; ok {
+		module, version, err := splitModule(arg)
+		if err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid module name: %v", err)
+		}
+		// only allow a version to be specified if it's different from the existing version
+		if _, ok := pluginPkgs[module]; ok && (version == "" || pluginPkgs[module].Version == version) {
 			return caddy.ExitCodeFailedStartup, fmt.Errorf("package is already added")
 		}
-		pluginPkgs[arg] = struct{}{}
+		pluginPkgs[module] = pluginPackage{Version: version, Path: module}
 	}
 
 	return upgradeBuild(pluginPkgs, fl)
@@ -81,7 +115,11 @@ func cmdRemovePackage(fl Flags) (int, error) {
 	}
 
 	for _, arg := range fl.Args() {
-		if _, ok := pluginPkgs[arg]; !ok {
+		module, _, err := splitModule(arg)
+		if err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid module name: %v", err)
+		}
+		if _, ok := pluginPkgs[module]; !ok {
 			// package does not exist
 			return caddy.ExitCodeFailedStartup, fmt.Errorf("package is not added")
 		}
@@ -91,7 +129,7 @@ func cmdRemovePackage(fl Flags) (int, error) {
 	return upgradeBuild(pluginPkgs, fl)
 }
 
-func upgradeBuild(pluginPkgs map[string]struct{}, fl Flags) (int, error) {
+func upgradeBuild(pluginPkgs map[string]pluginPackage, fl Flags) (int, error) {
 	l := caddy.Log()
 
 	thisExecPath, err := os.Executable()
@@ -102,6 +140,15 @@ func upgradeBuild(pluginPkgs map[string]struct{}, fl Flags) (int, error) {
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("retrieving current executable permission bits: %v", err)
 	}
+	if thisExecStat.Mode()&os.ModeSymlink == os.ModeSymlink {
+		symSource := thisExecPath
+		// we are a symlink; resolve it
+		thisExecPath, err = filepath.EvalSymlinks(thisExecPath)
+		if err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("resolving current executable symlink: %v", err)
+		}
+		l.Info("this executable is a symlink", zap.String("source", symSource), zap.String("target", thisExecPath))
+	}
 	l.Info("this executable will be replaced", zap.String("path", thisExecPath))
 
 	// build the request URL to download this custom build
@@ -109,8 +156,8 @@ func upgradeBuild(pluginPkgs map[string]struct{}, fl Flags) (int, error) {
 		"os":   {runtime.GOOS},
 		"arch": {runtime.GOARCH},
 	}
-	for pkg := range pluginPkgs {
-		qs.Add("p", pkg)
+	for _, pkgInfo := range pluginPkgs {
+		qs.Add("p", pkgInfo.String())
 	}
 
 	// initiate the build
@@ -178,7 +225,7 @@ func getModules() (standard, nonstandard, unknown []moduleInfo, err error) {
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
 		err = fmt.Errorf("no build info")
-		return
+		return standard, nonstandard, unknown, err
 	}
 
 	for _, modID := range caddy.Modules() {
@@ -194,8 +241,8 @@ func getModules() (standard, nonstandard, unknown []moduleInfo, err error) {
 		// can use reflection but we need a non-pointer value (I'm
 		// not sure why), and since New() should return a pointer
 		// value, we need to dereference it first
-		iface := interface{}(modInfo.New())
-		if rv := reflect.ValueOf(iface); rv.Kind() == reflect.Ptr {
+		iface := any(modInfo.New())
+		if rv := reflect.ValueOf(iface); rv.Kind() == reflect.Pointer {
 			iface = reflect.New(reflect.TypeOf(iface).Elem()).Elem().Interface()
 		}
 		modPkgPath := reflect.TypeOf(iface).PkgPath()
@@ -206,7 +253,7 @@ func getModules() (standard, nonstandard, unknown []moduleInfo, err error) {
 		// longest matching prefix in case there are nested modules
 		var matched *debug.Module
 		for _, dep := range bi.Deps {
-			if strings.HasPrefix(modPkgPath, dep.Path) {
+			if moduleContainsPackage(dep.Path, modPkgPath) {
 				if matched == nil || len(dep.Path) > len(matched.Path) {
 					matched = dep
 				}
@@ -215,13 +262,17 @@ func getModules() (standard, nonstandard, unknown []moduleInfo, err error) {
 
 		caddyModGoMod := moduleInfo{caddyModuleID: modID, goModule: matched}
 
-		if strings.HasPrefix(modPkgPath, caddy.ImportPath) {
+		if moduleContainsPackage(caddy.ImportPath, modPkgPath) {
 			standard = append(standard, caddyModGoMod)
 		} else {
 			nonstandard = append(nonstandard, caddyModGoMod)
 		}
 	}
-	return
+	return standard, nonstandard, unknown, err
+}
+
+func moduleContainsPackage(modulePath, packagePath string) bool {
+	return packagePath == modulePath || strings.HasPrefix(packagePath, modulePath+"/")
 }
 
 func listModules(path string) error {
@@ -249,6 +300,7 @@ func downloadBuild(qs url.Values) (*http.Response, error) {
 		return nil, fmt.Errorf("secure request failed: %v", err)
 	}
 	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
 		var details struct {
 			StatusCode int `json:"status_code"`
 			Error      struct {
@@ -265,14 +317,14 @@ func downloadBuild(qs url.Values) (*http.Response, error) {
 	return resp, nil
 }
 
-func getPluginPackages(modules []moduleInfo) (map[string]struct{}, error) {
-	pluginPkgs := make(map[string]struct{})
+func getPluginPackages(modules []moduleInfo) (map[string]pluginPackage, error) {
+	pluginPkgs := make(map[string]pluginPackage)
 	for _, mod := range modules {
 		if mod.goModule.Replace != nil {
 			return nil, fmt.Errorf("cannot auto-upgrade when Go module has been replaced: %s => %s",
 				mod.goModule.Path, mod.goModule.Replace.Path)
 		}
-		pluginPkgs[mod.goModule.Path] = struct{}{}
+		pluginPkgs[mod.goModule.Path] = pluginPackage{Version: mod.goModule.Version, Path: mod.goModule.Path}
 	}
 	return pluginPkgs, nil
 }
@@ -301,3 +353,15 @@ func writeCaddyBinary(path string, body *io.ReadCloser, fileInfo os.FileInfo) er
 }
 
 const downloadPath = "https://caddyserver.com/api/download"
+
+type pluginPackage struct {
+	Version string
+	Path    string
+}
+
+func (p pluginPackage) String() string {
+	if p.Version == "" {
+		return p.Path
+	}
+	return p.Path + "@" + p.Version
+}

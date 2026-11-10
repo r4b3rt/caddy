@@ -1,15 +1,108 @@
 package encode
 
 import (
+	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func BenchmarkOpenResponseWriter(b *testing.B) {
 	enc := new(Encode)
-	for n := 0; n < b.N; n++ {
-		enc.openResponseWriter("test", nil)
+	for b.Loop() {
+		enc.openResponseWriter("test", nil, false)
+	}
+}
+
+// discardResponseWriter is a minimal http.ResponseWriter used to isolate
+// WriteHeader's own cost from a real transport.
+type discardResponseWriter struct {
+	header http.Header
+}
+
+func (w *discardResponseWriter) Header() http.Header         { return w.header }
+func (w *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *discardResponseWriter) WriteHeader(int)             {}
+
+// BenchmarkResponseWriterWriteHeader covers the branches inside WriteHeader:
+// the plain/common case, the SSE Content-Type check (both when it doesn't
+// match and when it does and rw.init() runs), CONNECT 2xx, informational
+// (1xx), and 304 Not Modified (Vary bookkeeping).
+func BenchmarkResponseWriterWriteHeader(b *testing.B) {
+	benchCases := []struct {
+		name        string
+		encoding    string
+		isConnect   bool
+		status      int
+		contentType string
+	}{
+		{name: "plain", encoding: "test", status: http.StatusOK},
+		{name: "html", encoding: "test", status: http.StatusOK, contentType: "text/html; charset=utf-8"},
+		{name: "event-stream", encoding: "gzip", status: http.StatusOK, contentType: "text/event-stream"},
+		{name: "connect", encoding: "test", isConnect: true, status: http.StatusOK},
+		{name: "informational", encoding: "test", status: http.StatusEarlyHints},
+		{name: "not-modified", encoding: "test", status: http.StatusNotModified},
+	}
+
+	for _, bc := range benchCases {
+		b.Run(bc.name, func(b *testing.B) {
+			enc := new(Encode)
+			if bc.name == "event-stream" {
+				enc.writerPools = map[string]*sync.Pool{
+					"gzip": {New: func() any { return mockEncoder{} }},
+				}
+				ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+				defer cancel()
+				if err := enc.Provision(ctx); err != nil {
+					b.Fatalf("Provision() error = %v", err)
+				}
+			}
+
+			w := &discardResponseWriter{header: make(http.Header)}
+			rw := enc.openResponseWriter(bc.encoding, w, bc.isConnect)
+
+			for b.Loop() {
+				for k := range rw.Header() {
+					delete(rw.Header(), k)
+				}
+				if bc.contentType != "" {
+					rw.Header().Set("Content-Type", bc.contentType)
+				}
+				rw.wroteHeader = false
+				rw.statusCode = 0
+				rw.disabled = false
+				rw.w = nil
+				rw.WriteHeader(bc.status)
+			}
+		})
+	}
+}
+
+func TestIsSSE(t *testing.T) {
+	for _, tc := range []struct {
+		contentType string
+		want        bool
+	}{
+		{"", false},
+		{"text/plain", false},
+		{"text/event-stream", true},
+		{"Text/Event-Stream", true},
+		{"text/event-stream; charset=utf-8", true},
+		{"text/event-stream ; charset=utf-8", true},
+		{"text/event-stream  ", true},
+		{"text/event-streamfoo", false},
+		{"text/event-stream nonsense", false},
+		{"text/event-stream x; charset=utf-8", false},
+	} {
+		if got := isSSE(tc.contentType); got != tc.want {
+			t.Errorf("isSSE(%q) = %v, want %v", tc.contentType, got, tc.want)
+		}
 	}
 }
 
@@ -36,7 +129,7 @@ func TestPreferOrder(t *testing.T) {
 			name:     "PreferOrder(): 2 accept (1 empty), 3 prefer",
 			accept:   "gzip,,zstd",
 			prefer:   []string{"zstd", "br", "gzip"},
-			expected: []string{"zstd", "gzip", ""},
+			expected: []string{"zstd", "gzip"},
 		},
 		{
 			name:     "PreferOrder(): 1 accept, 2 prefer",
@@ -105,7 +198,6 @@ func TestPreferOrder(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-
 			if test.accept == "" {
 				r.Header.Del("Accept-Encoding")
 			} else {
@@ -113,25 +205,13 @@ func TestPreferOrder(t *testing.T) {
 			}
 			enc.Prefer = test.prefer
 			result := AcceptedEncodings(r, enc.Prefer)
-			if !sliceEqual(result, test.expected) {
+			if !slices.Equal(result, test.expected) {
 				t.Errorf("AcceptedEncodings() actual: %s expected: %s",
 					result,
 					test.expected)
 			}
 		})
 	}
-}
-
-func sliceEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func TestValidate(t *testing.T) {
@@ -258,6 +338,175 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr = %v", err, test.wantErr)
 			}
 		})
+	}
+}
 
+func TestServeHTTPResponseNoTransform(t *testing.T) {
+	enc := &Encode{
+		MinLength: 1,
+		writerPools: map[string]*sync.Pool{
+			"gzip": {New: func() any { return mockEncoder{} }},
+		},
+	}
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	if err := enc.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	for _, tc := range []struct {
+		cacheControl []string
+		encoded      bool
+	}{
+		{cacheControl: nil, encoded: true},
+		{cacheControl: []string{"no-cache, no-transform"}, encoded: false},
+		{cacheControl: []string{"max-age=0, No-Transform"}, encoded: false},
+		{cacheControl: []string{"no-cache", "no-transform"}, encoded: false},
+		{cacheControl: []string{`private="Set-Cookie, Vary", no-transform`}, encoded: false},
+		// extension values and longer tokens are not the directive
+		{cacheControl: []string{`community="no-transform"`}, encoded: true},
+		{cacheControl: []string{"community=no-transform"}, encoded: true},
+		{cacheControl: []string{"x-no-transform-ext, no-transformation"}, encoded: true},
+		// semicolons are not Cache-Control list separators
+		{cacheControl: []string{"no-cache; no-transform"}, encoded: true},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Accept-Encoding", "gzip")
+		w := httptest.NewRecorder()
+		err := enc.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			w.Header()["Content-Type"] = []string{"text/plain"}
+			w.Header()["Cache-Control"] = tc.cacheControl
+			_, err := w.Write([]byte("hello"))
+			return err
+		}))
+		if err != nil {
+			t.Fatalf("Cache-Control %q: ServeHTTP: %v", tc.cacheControl, err)
+		}
+		if encoded := w.Header().Get("Content-Encoding") == "gzip"; encoded != tc.encoded {
+			t.Errorf("Cache-Control %q: encoded = %t, want %t", tc.cacheControl, encoded, tc.encoded)
+		}
+	}
+}
+
+type mockEncoder struct{}
+
+func (mockEncoder) Write(p []byte) (n int, err error) { return len(p), nil }
+func (mockEncoder) Close() error                      { return nil }
+func (mockEncoder) Reset(w io.Writer)                 {}
+func (mockEncoder) Flush() error                      { return nil }
+
+func TestServeHTTPDefaultEncodingPreference(t *testing.T) {
+	enc := new(Encode)
+	enc.MinLength = 1 // compress everything
+	enc.writerPools = map[string]*sync.Pool{
+		"gzip": {
+			New: func() any { return mockEncoder{} },
+		},
+		"zstd": {
+			New: func() any { return mockEncoder{} },
+		},
+	}
+
+	// Call Provision() with a valid caddy.Context to exercise the real path
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	if err := enc.Provision(ctx); err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	// Test default preference: zstd preferred over gzip
+	r, err := http.NewRequest("GET", "/", nil)
+	if err != nil {
+		t.Fatalf("error creating request: %v", err)
+	}
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Type", "text/plain")
+
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte("Hello, world! This is a long enough string to satisfy min length if it wasn't 1."))
+		return err
+	})
+
+	err = enc.ServeHTTP(w, r, next)
+	if err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+
+	// ETag suffix or Content-Encoding header should reflect zstd
+	contentEncoding := w.Header().Get("Content-Encoding")
+	if contentEncoding != "zstd" {
+		t.Errorf("Expected Content-Encoding to be 'zstd' by default, got '%s'", contentEncoding)
+	}
+
+	// Test explicit user preference: gzip over zstd
+	enc.Prefer = []string{"gzip", "zstd"}
+
+	w2 := httptest.NewRecorder()
+	w2.Header().Set("Content-Type", "text/plain")
+	err = enc.ServeHTTP(w2, r, next)
+	if err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+
+	contentEncoding2 := w2.Header().Get("Content-Encoding")
+	if contentEncoding2 != "gzip" {
+		t.Errorf("Expected Content-Encoding to be 'gzip' when explicitly preferred, got '%s'", contentEncoding2)
+	}
+}
+
+// RFC 9110 section 5.3: a recipient MAY combine multiple field lines with the
+// same name by joining their values with commas; the semantics of a list-based
+// field like Accept-Encoding do not change when it is split across lines.
+func TestAcceptedEncodingsMultipleFieldLines(t *testing.T) {
+	for _, tc := range []struct {
+		lines    []string
+		expected []string
+	}{
+		{[]string{"gzip", "br"}, []string{"br", "gzip"}},
+		{[]string{"identity", "br"}, []string{"br", "identity"}},
+		{[]string{"gzip;q=0", "br"}, []string{"br"}},
+		{[]string{"", "gzip"}, []string{"gzip"}},
+		{[]string{"gzip;q=0.5", "zstd;q=0.8, br;q=0"}, []string{"zstd", "gzip"}},
+	} {
+		r, _ := http.NewRequest(http.MethodGet, "/", nil)
+		for _, l := range tc.lines {
+			r.Header.Add("Accept-Encoding", l)
+		}
+		got := AcceptedEncodings(r, []string{"zstd", "br", "gzip"})
+		if !slices.Equal(got, tc.expected) {
+			t.Errorf("Accept-Encoding lines %q: got %v, expected %v", tc.lines, got, tc.expected)
+		}
+	}
+}
+
+func TestServeHTTPMultipleAcceptEncodingLines(t *testing.T) {
+	enc := new(Encode)
+	enc.MinLength = 1
+	enc.writerPools = map[string]*sync.Pool{
+		"br": {New: func() any { return mockEncoder{} }},
+	}
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+	defer cancel()
+	if err := enc.Provision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := http.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Add("Accept-Encoding", "identity")
+	r.Header.Add("Accept-Encoding", "br")
+	w := httptest.NewRecorder()
+	w.Header().Set("Content-Type", "text/plain")
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte("hello world"))
+		return err
+	})
+	if err := enc.ServeHTTP(w, r, next); err != nil {
+		t.Fatal(err)
+	}
+	if ce := w.Header().Get("Content-Encoding"); ce != "br" {
+		t.Errorf("expected Content-Encoding br, got %q", ce)
 	}
 }

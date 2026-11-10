@@ -19,6 +19,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,13 +28,71 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
+func TestMissingCookiePlaceholder(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), VarsCtxKey, map[string]any{}))
+	repl := NewTestReplacer(req)
+	const input = "before-{http.request.cookie.session}-after"
+	if got := repl.ReplaceKnown(input, ""); got != "before--after" {
+		t.Fatalf("missing cookie = %q, want %q", got, "before--after")
+	}
+	req.AddCookie(&http.Cookie{Name: "session", Value: "present"})
+	if got := repl.ReplaceKnown(input, ""); got != "before-present-after" {
+		t.Fatalf("present cookie = %q, want %q", got, "before-present-after")
+	}
+}
+
+func TestTLSPlaceholdersWithoutTLS(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), VarsCtxKey, map[string]any{}))
+	repl := NewTestReplacer(req)
+	for _, field := range []string{
+		"version", "cipher_suite", "resumed", "proto", "proto_mutual", "server_name", "ech",
+		"client.fingerprint", "client.public_key", "client.public_key_sha256",
+		"client.issuer", "client.serial", "client.subject", "client.certificate_pem", "client.certificate_der_base64",
+		"client.san.dns_names", "client.san.emails", "client.san.ips", "client.san.uris",
+		"client.san.dns_names.0", "client.san.emails.0", "client.san.ips.0", "client.san.uris.0",
+	} {
+		t.Run(field, func(t *testing.T) {
+			key := "http.request.tls." + field
+			value, known := repl.Get(key)
+			if !known || caddy.ToString(value) != "" {
+				t.Fatalf("Get(%q) = %v, %v; want empty, known", key, value, known)
+			}
+			if got := repl.ReplaceKnown("before-{"+key+"}-after", ""); got != "before--after" {
+				t.Fatalf("replacement = %q, want %q", got, "before--after")
+			}
+		})
+	}
+}
+
+func TestUnknownTLSPlaceholdersRemainLiteral(t *testing.T) {
+	for _, state := range []*tls.ConnectionState{nil, {ServerName: "example.com"}} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.TLS = state
+		req = req.WithContext(context.WithValue(req.Context(), VarsCtxKey, map[string]any{}))
+		repl := NewTestReplacer(req)
+		for _, field := range []string{
+			"unknown", "client.unknown", "client.san.unknown",
+			"client.san.dns_names_extra", "client.san.dns_names.-1", "client.san.dns_names.nope",
+		} {
+			input := "{http.request.tls." + field + "}"
+			if got := repl.ReplaceKnown(input, ""); got != input {
+				t.Errorf("replacement = %q, want literal %q", got, input)
+			}
+		}
+	}
+}
+
 func TestHTTPVarReplacement(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz?a=1&b=2", nil)
 	repl := caddy.NewReplacer()
+	localAddr, _ := net.ResolveTCPAddr("tcp", "192.168.159.1:80")
 	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, http.LocalAddrContextKey, localAddr)
 	req = req.WithContext(ctx)
 	req.Host = "example.com:80"
-	req.RemoteAddr = "localhost:1234"
+	req.RemoteAddr = "192.168.159.32:1234"
 
 	clientCert := []byte(`-----BEGIN CERTIFICATE-----
 MIIB9jCCAV+gAwIBAgIBAjANBgkqhkiG9w0BAQsFADAYMRYwFAYDVQQDDA1DYWRk
@@ -61,7 +121,7 @@ eqp31wM9il1n+guTNyxJd+FzVAH+hCZE5K+tCgVDdVFUlDEHHbS/wqb2PSIoouLV
 	req.TLS = &tls.ConnectionState{
 		Version:                    tls.VersionTLS13,
 		HandshakeComplete:          true,
-		ServerName:                 "foo.com",
+		ServerName:                 "example.com",
 		CipherSuite:                tls.TLS_AES_256_GCM_SHA384,
 		PeerCertificates:           []*x509.Certificate{cert},
 		NegotiatedProtocol:         "h2",
@@ -72,114 +132,333 @@ eqp31wM9il1n+guTNyxJd+FzVAH+hCZE5K+tCgVDdVFUlDEHHbS/wqb2PSIoouLV
 	addHTTPVarsToReplacer(repl, req, res)
 
 	for i, tc := range []struct {
-		input  string
+		get    string
 		expect string
 	}{
 		{
-			input:  "{http.request.scheme}",
+			get:    "http.request.scheme",
 			expect: "https",
 		},
 		{
-			input:  "{http.request.host}",
+			get:    "http.request.method",
+			expect: http.MethodGet,
+		},
+		{
+			get:    "http.request.host",
 			expect: "example.com",
 		},
 		{
-			input:  "{http.request.port}",
+			get:    "http.request.port",
 			expect: "80",
 		},
 		{
-			input:  "{http.request.hostport}",
+			get:    "http.request.hostport",
 			expect: "example.com:80",
 		},
 		{
-			input:  "{http.request.remote.host}",
-			expect: "localhost",
+			get:    "http.request.local.host",
+			expect: "192.168.159.1",
 		},
 		{
-			input:  "{http.request.remote.port}",
+			get:    "http.request.local.port",
+			expect: "80",
+		},
+		{
+			get:    "http.request.local",
+			expect: "192.168.159.1:80",
+		},
+		{
+			get:    "http.request.remote.host",
+			expect: "192.168.159.32",
+		},
+		{
+			get:    "http.request.remote.host/24",
+			expect: "192.168.159.0/24",
+		},
+		{
+			get:    "http.request.remote.host/24,32",
+			expect: "192.168.159.0/24",
+		},
+		{
+			get:    "http.request.remote.host/999",
+			expect: "",
+		},
+		{
+			get:    "http.request.remote.port",
 			expect: "1234",
 		},
 		{
-			input:  "{http.request.host.labels.0}",
+			get:    "http.request.host.labels.0",
 			expect: "com",
 		},
 		{
-			input:  "{http.request.host.labels.1}",
+			get:    "http.request.host.labels.1",
 			expect: "example",
 		},
 		{
-			input:  "{http.request.host.labels.2}",
-			expect: "<empty>",
+			get:    "http.request.host.labels.2",
+			expect: "",
 		},
 		{
-			input:  "{http.request.tls.cipher_suite}",
-			expect: "TLS_AES_256_GCM_SHA384",
+			get:    "http.request.uri",
+			expect: "/foo/bar.tar.gz?a=1&b=2",
 		},
 		{
-			input:  "{http.request.tls.proto}",
-			expect: "h2",
+			get:    "http.request.uri_escaped",
+			expect: "%2Ffoo%2Fbar.tar.gz%3Fa%3D1%26b%3D2",
 		},
 		{
-			input:  "{http.request.tls.proto_mutual}",
-			expect: "true",
+			get:    "http.request.uri.path",
+			expect: "/foo/bar.tar.gz",
 		},
 		{
-			input:  "{http.request.tls.resumed}",
-			expect: "false",
+			get:    "http.request.uri.path_escaped",
+			expect: "%2Ffoo%2Fbar.tar.gz",
 		},
 		{
-			input:  "{http.request.tls.server_name}",
-			expect: "foo.com",
+			get:    "http.request.uri.path.file",
+			expect: "bar.tar.gz",
 		},
 		{
-			input:  "{http.request.tls.version}",
-			expect: "tls1.3",
+			get:    "http.request.uri.path.file.base",
+			expect: "bar.tar",
 		},
 		{
-			input:  "{http.request.tls.client.fingerprint}",
-			expect: "9f57b7b497cceacc5459b76ac1c3afedbc12b300e728071f55f84168ff0f7702",
+			// not ideal, but also most correct, given that files can have dots (example: index.<SHA>.html) TODO: maybe this isn't right..
+			get:    "http.request.uri.path.file.ext",
+			expect: ".gz",
 		},
 		{
-			input:  "{http.request.tls.client.issuer}",
-			expect: "CN=Caddy Test CA",
+			get:    "http.request.uri.query",
+			expect: "a=1&b=2",
 		},
 		{
-			input:  "{http.request.tls.client.serial}",
+			get:    "http.request.uri.query_escaped",
+			expect: "a%3D1%26b%3D2",
+		},
+		{
+			get:    "http.request.uri.query.a",
+			expect: "1",
+		},
+		{
+			get:    "http.request.uri.query.b",
 			expect: "2",
 		},
 		{
-			input:  "{http.request.tls.client.subject}",
+			get:    "http.request.uri.prefixed_query",
+			expect: "?a=1&b=2",
+		},
+		{
+			get:    "http.request.tls.cipher_suite",
+			expect: "TLS_AES_256_GCM_SHA384",
+		},
+		{
+			get:    "http.request.tls.proto",
+			expect: "h2",
+		},
+		{
+			get:    "http.request.tls.proto_mutual",
+			expect: "true",
+		},
+		{
+			get:    "http.request.tls.resumed",
+			expect: "false",
+		},
+		{
+			get:    "http.request.tls.server_name",
+			expect: "example.com",
+		},
+		{
+			get:    "http.request.tls.version",
+			expect: "tls1.3",
+		},
+		{
+			get:    "http.request.tls.client.fingerprint",
+			expect: "9f57b7b497cceacc5459b76ac1c3afedbc12b300e728071f55f84168ff0f7702",
+		},
+		{
+			get:    "http.request.tls.client.issuer",
+			expect: "CN=Caddy Test CA",
+		},
+		{
+			get:    "http.request.tls.client.serial",
+			expect: "2",
+		},
+		{
+			get:    "http.request.tls.client.subject",
 			expect: "CN=client.localdomain",
 		},
 		{
-			input:  "{http.request.tls.client.san.dns_names}",
+			get:    "http.request.tls.client.san.dns_names",
 			expect: "[localhost]",
 		},
 		{
-			input:  "{http.request.tls.client.san.dns_names.0}",
+			get:    "http.request.tls.client.san.dns_names.0",
 			expect: "localhost",
 		},
 		{
-			input:  "{http.request.tls.client.san.dns_names.1}",
-			expect: "<empty>",
+			get:    "http.request.tls.client.san.dns_names.1",
+			expect: "",
 		},
 		{
-			input:  "{http.request.tls.client.san.ips}",
+			get:    "http.request.tls.client.san.ips",
 			expect: "[127.0.0.1]",
 		},
 		{
-			input:  "{http.request.tls.client.san.ips.0}",
+			get:    "http.request.tls.client.san.ips.0",
 			expect: "127.0.0.1",
 		},
 		{
-			input:  "{http.request.tls.client.certificate_pem}",
+			get:    "http.request.tls.client.certificate_pem",
 			expect: string(clientCert) + "\n", // returned value comes with a newline appended to it
 		},
 	} {
-		actual := repl.ReplaceAll(tc.input, "<empty>")
-		if actual != tc.expect {
-			t.Errorf("Test %d: Expected placeholder %s to be '%s' but got '%s'",
-				i, tc.input, tc.expect, actual)
+		actual, got := repl.GetString(tc.get)
+		if !got {
+			t.Errorf("Test %d: Expected to recognize the placeholder name, but didn't", i)
 		}
+		if actual != tc.expect {
+			t.Errorf("Test %d: Expected %s to be '%s' but got '%s'",
+				i, tc.get, tc.expect, actual)
+		}
+	}
+}
+
+func TestHTTPProtoNameNormalization(t *testing.T) {
+	for _, tc := range []struct {
+		proto      string
+		major      int
+		expectRaw  string
+		expectName string
+	}{
+		{proto: "HTTP/1.0", major: 1, expectRaw: "HTTP/1.0", expectName: "HTTP/1.0"},
+		{proto: "HTTP/1.1", major: 1, expectRaw: "HTTP/1.1", expectName: "HTTP/1.1"},
+		{proto: "HTTP/2.0", major: 2, expectRaw: "HTTP/2.0", expectName: "HTTP/2"},
+		{proto: "HTTP/3.0", major: 3, expectRaw: "HTTP/3.0", expectName: "HTTP/3"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Proto = tc.proto
+		req.ProtoMajor = tc.major
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+
+		gotRaw, okRaw := repl.GetString("http.request.proto")
+		if !okRaw || gotRaw != tc.expectRaw {
+			t.Errorf("proto=%s: expected http.request.proto to be %q, got %q (ok=%t)", tc.proto, tc.expectRaw, gotRaw, okRaw)
+		}
+
+		gotName, okName := repl.GetString("http.request.proto_name")
+		if !okName || gotName != tc.expectName {
+			t.Errorf("proto=%s: expected http.request.proto_name to be %q, got %q (ok=%t)", tc.proto, tc.expectName, gotName, okName)
+		}
+	}
+}
+
+// BenchmarkAddHTTPVarsToReplacer measures the per-request replacer setup, which
+// is the common path where the request UUID is never referenced.
+func BenchmarkAddHTTPVarsToReplacer(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/foo?a=b", nil)
+	req.Header.Set("User-Agent", "test-agent")
+	ctx := context.WithValue(req.Context(), VarsCtxKey, make(map[string]any))
+	ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+	req = req.WithContext(ctx)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		repl := caddy.NewReplacer()
+		addHTTPVarsToReplacer(repl, req, nil)
+	}
+}
+
+// TestHTTPVarReplacementUUID verifies the lazily-allocated request UUID is
+// generated on first access and stays stable across references.
+func TestHTTPVarReplacementUUID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]any))
+	ctx = context.WithValue(ctx, ExtraLogFieldsCtxKey, new(ExtraLogFields))
+	req = req.WithContext(ctx)
+	addHTTPVarsToReplacer(repl, req, nil)
+
+	first, ok := repl.GetString("http.request.uuid")
+	if !ok || first == "" {
+		t.Fatalf("expected a non-empty uuid, got %q (ok=%t)", first, ok)
+	}
+
+	second, _ := repl.GetString("http.request.uuid")
+	if first != second {
+		t.Errorf("expected stable uuid across references: %q != %q", first, second)
+	}
+}
+
+// failingBodyReader serves some bytes and then returns a fixed error, to
+// exercise the read failure path of the request body placeholders.
+type failingBodyReader struct {
+	data []byte
+	pos  int
+	err  error
+}
+
+func (b *failingBodyReader) Read(p []byte) (int, error) {
+	if b.pos < len(b.data) {
+		n := copy(p, b.data[b.pos:])
+		b.pos += n
+		return n, nil
+	}
+	return 0, b.err
+}
+
+func (b *failingBodyReader) Close() error { return nil }
+
+// TestRequestBodyPlaceholderErrorScoping verifies that only a max_size-driven
+// handler error from the request body read becomes a RequestBodyLimitError,
+// while every other error keeps the placeholder's old ignore-and-truncate
+// behavior.
+func TestRequestBodyPlaceholderErrorScoping(t *testing.T) {
+	maxBytes := &http.MaxBytesError{Limit: 10}
+	for _, tc := range []struct {
+		name       string
+		readErr    error
+		wantMarker bool
+	}{
+		{name: "max_size handler error becomes the marker", readErr: HandlerError{Err: maxBytes, StatusCode: http.StatusRequestEntityTooLarge}, wantMarker: true},
+		{name: "unrelated handler error keeps old behavior", readErr: HandlerError{Err: errors.New("boom"), StatusCode: http.StatusInternalServerError}},
+		{name: "raw max bytes error keeps old behavior", readErr: maxBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.Body = &failingBodyReader{data: []byte("abc"), err: tc.readErr}
+
+			body, err := readRequestBodyForPlaceholder(req)
+
+			if !tc.wantMarker {
+				if err != nil {
+					t.Fatalf("unrelated errors must be ignored like before but got %v", err)
+				}
+				if string(body) != "abc" {
+					t.Errorf("expected the truncated prefix %q but got %q", "abc", body)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected the body limit marker but got none")
+			}
+			var marker RequestBodyLimitError
+			if !errors.As(err, &marker) {
+				t.Fatalf("expected RequestBodyLimitError but got %T", err)
+			}
+			var handlerErr HandlerError
+			if errors.As(err, &handlerErr) {
+				t.Error("the marker must not be detectable as a HandlerError")
+			}
+			if marker.StatusCode() != http.StatusRequestEntityTooLarge {
+				t.Errorf("expected status 413 but got %d", marker.StatusCode())
+			}
+			var maxErr *http.MaxBytesError
+			if !errors.As(err, &maxErr) {
+				t.Error("the marker must unwrap to the MaxBytesError")
+			}
+		})
 	}
 }

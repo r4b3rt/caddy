@@ -5,21 +5,22 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/caddyserver/caddy/v2"
-
-	caddycmd "github.com/caddyserver/caddy/v2/cmd"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/contrib/propagators/autoprop"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 const (
-	webEngineName                = "Caddy"
 	defaultSpanName              = "handler"
 	nextCallCtxKey  caddy.CtxKey = "nextCall"
 )
@@ -36,48 +37,97 @@ type openTelemetryWrapper struct {
 
 	handler http.Handler
 
-	spanName string
+	spanName       string
+	spanAttributes map[string]string
 }
 
 // newOpenTelemetryWrapper is responsible for the openTelemetryWrapper initialization using provided configuration.
 func newOpenTelemetryWrapper(
 	ctx context.Context,
 	spanName string,
+	spanAttributes map[string]string,
 ) (openTelemetryWrapper, error) {
 	if spanName == "" {
 		spanName = defaultSpanName
 	}
 
 	ot := openTelemetryWrapper{
-		spanName: spanName,
+		spanName:       spanName,
+		spanAttributes: spanAttributes,
 	}
 
-	res, err := ot.newResource(webEngineName, caddycmd.CaddyVersion())
+	version, _ := caddy.Version()
+	res, err := ot.newResource(caddyhttp.ServerHeader, version)
 	if err != nil {
 		return ot, fmt.Errorf("creating resource error: %w", err)
 	}
 
-	traceExporter, err := otlptracegrpc.New(ctx)
+	ot.propagators = autoprop.NewTextMapPropagator()
+
+	// Defer creation of the exporter (and its batch span processor goroutine)
+	// until we know a new provider is actually needed. When the global provider
+	// already exists it is reused and these options are discarded; building them
+	// here unconditionally would leak the exporter and a BatchSpanProcessor
+	// goroutine on every config reload.
+	tracerProvider, err := globalTracerProvider.getTracerProvider(func() ([]sdktrace.TracerProviderOption, error) {
+		traceExporter, err := autoexport.NewSpanExporter(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("creating trace exporter error: %w", err)
+		}
+
+		return []sdktrace.TracerProviderOption{
+			sdktrace.WithBatcher(traceExporter),
+			sdktrace.WithResource(res),
+		}, nil
+	})
 	if err != nil {
-		return ot, fmt.Errorf("creating trace exporter error: %w", err)
+		return ot, err
 	}
 
-	ot.propagators = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
-
-	tracerProvider := globalTracerProvider.getTracerProvider(
-		sdktrace.WithBatcher(traceExporter),
-		sdktrace.WithResource(res),
+	ot.handler = otelhttp.NewHandler(http.HandlerFunc(ot.serveHTTP),
+		ot.spanName,
+		otelhttp.WithTracerProvider(tracerProvider),
+		otelhttp.WithPropagators(ot.propagators),
+		otelhttp.WithSpanNameFormatter(ot.spanNameFormatter),
 	)
 
-	ot.handler = otelhttp.NewHandler(http.HandlerFunc(ot.serveHTTP), ot.spanName, otelhttp.WithTracerProvider(tracerProvider), otelhttp.WithPropagators(ot.propagators))
 	return ot, nil
 }
 
 // serveHTTP injects a tracing context and call the next handler.
 func (ot *openTelemetryWrapper) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	ot.propagators.Inject(r.Context(), propagation.HeaderCarrier(r.Header))
-	next := r.Context().Value(nextCallCtxKey).(*nextCall)
+	ctx := r.Context()
+	ot.propagators.Inject(ctx, propagation.HeaderCarrier(r.Header))
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.IsValid() {
+		traceID := spanCtx.TraceID().String()
+		spanID := spanCtx.SpanID().String()
+		// Add a trace_id placeholder, accessible via `{http.vars.trace_id}`.
+		caddyhttp.SetVar(ctx, "trace_id", traceID)
+		// Add a span_id placeholder, accessible via `{http.vars.span_id}`.
+		caddyhttp.SetVar(ctx, "span_id", spanID)
+		// Add the traceID and spanID to the log fields for the request.
+		if extra, ok := ctx.Value(caddyhttp.ExtraLogFieldsCtxKey).(*caddyhttp.ExtraLogFields); ok {
+			extra.Add(zap.String("traceID", traceID))
+			extra.Add(zap.String("spanID", spanID))
+		}
+	}
+
+	next := ctx.Value(nextCallCtxKey).(*nextCall)
 	next.err = next.next.ServeHTTP(w, r)
+
+	// Add custom span attributes to the current span
+	span := trace.SpanFromContext(ctx)
+	if span.IsRecording() && len(ot.spanAttributes) > 0 {
+		replacer := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		attributes := make([]attribute.KeyValue, 0, len(ot.spanAttributes))
+		for key, value := range ot.spanAttributes {
+			// Allow placeholder replacement in attribute values
+			replacedValue := replacer.ReplaceAll(value, "")
+			attributes = append(attributes, attribute.String(key, replacedValue))
+		}
+		span.SetAttributes(attributes...)
+	}
 }
 
 // ServeHTTP propagates call to the by wrapped by `otelhttp` next handler.
@@ -102,7 +152,12 @@ func (ot *openTelemetryWrapper) newResource(
 	webEngineVersion string,
 ) (*resource.Resource, error) {
 	return resource.Merge(resource.Default(), resource.NewSchemaless(
-		semconv.WebEngineNameKey.String(webEngineName),
-		semconv.WebEngineVersionKey.String(webEngineVersion),
+		semconv.WebEngineName(webEngineName),
+		semconv.WebEngineVersion(webEngineVersion),
 	))
+}
+
+// spanNameFormatter performs the replacement of placeholders in the span name
+func (ot *openTelemetryWrapper) spanNameFormatter(operation string, r *http.Request) string {
+	return r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer).ReplaceAll(operation, "")
 }

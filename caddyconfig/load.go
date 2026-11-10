@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -58,6 +60,10 @@ func (al adminLoad) Routes() []caddy.AdminRoute {
 			Pattern: "/load",
 			Handler: caddy.AdminHandlerFunc(al.handleLoad),
 		},
+		{
+			Pattern: "/adapt",
+			Handler: caddy.AdminHandlerFunc(al.handleAdapt),
+		},
 	}
 }
 
@@ -87,42 +93,97 @@ func (adminLoad) handleLoad(w http.ResponseWriter, r *http.Request) error {
 	}
 	body := buf.Bytes()
 
+	var warnings []Warning
 	// if the config is formatted other than Caddy's native
 	// JSON, we need to adapt it before loading it
 	if ctHeader := r.Header.Get("Content-Type"); ctHeader != "" {
-		result, warnings, err := adaptByContentType(ctHeader, body)
+		result, wns, err := adaptByContentType(ctHeader, body)
 		if err != nil {
 			return caddy.APIError{
 				HTTPStatus: http.StatusBadRequest,
 				Err:        err,
+				Warnings:   wns,
 			}
 		}
-		if len(warnings) > 0 {
-			respBody, err := json.Marshal(warnings)
-			if err != nil {
-				caddy.Log().Named("admin.api.load").Error(err.Error())
-			}
-			_, _ = w.Write(respBody)
-		}
+		warnings = wns
 		body = result
 	}
 
-	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
+	forceReload := httpguts.HeaderValuesContainsToken(r.Header["Cache-Control"], "must-revalidate")
 
 	err = caddy.Load(body, forceReload)
 	if err != nil {
 		return caddy.APIError{
 			HTTPStatus: http.StatusBadRequest,
 			Err:        fmt.Errorf("loading config: %v", err),
+			Warnings:   warnings,
 		}
 	}
 
+	// If this request changed the config, clear the last
+	// config info we have stored, if it is different from
+	// the original source.
+	caddy.ClearLastConfigIfDifferent(
+		r.Header.Get("Caddy-Config-Source-File"),
+		r.Header.Get("Caddy-Config-Source-Adapter"))
+
 	caddy.Log().Named("admin.api").Info("load complete")
+
+	// Send any warnings back even if there were no errors
+	if len(warnings) > 0 {
+		out := struct {
+			Warnings []Warning `json:"warnings"`
+		}{
+			Warnings: warnings,
+		}
+		return json.NewEncoder(w).Encode(out)
+	}
 
 	return nil
 }
 
-// adaptByContentType adapts body to Caddy JSON using the adapter specified by contenType.
+// handleAdapt adapts the given Caddy config to JSON and responds with the result.
+func (adminLoad) handleAdapt(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		return caddy.APIError{
+			HTTPStatus: http.StatusMethodNotAllowed,
+			Err:        fmt.Errorf("method not allowed"),
+		}
+	}
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	_, err := io.Copy(buf, r.Body)
+	if err != nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        fmt.Errorf("reading request body: %v", err),
+		}
+	}
+
+	result, warnings, err := adaptByContentType(r.Header.Get("Content-Type"), buf.Bytes())
+	if err != nil {
+		return caddy.APIError{
+			HTTPStatus: http.StatusBadRequest,
+			Err:        err,
+		}
+	}
+
+	out := struct {
+		Warnings []Warning       `json:"warnings,omitempty"`
+		Result   json.RawMessage `json:"result"`
+	}{
+		Warnings: warnings,
+		Result:   result,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(out)
+}
+
+// adaptByContentType adapts body to Caddy JSON using the adapter specified by contentType.
 // If contentType is empty or ends with "/json", the input will be returned, as a no-op.
 func adaptByContentType(contentType string, body []byte) ([]byte, []Warning, error) {
 	// assume JSON as the default
@@ -144,12 +205,11 @@ func adaptByContentType(contentType string, body []byte) ([]byte, []Warning, err
 	}
 
 	// adapter name should be suffix of MIME type
-	slashIdx := strings.Index(ct, "/")
-	if slashIdx < 0 {
+	_, adapterName, slashFound := strings.Cut(ct, "/")
+	if !slashFound {
 		return nil, nil, fmt.Errorf("malformed Content-Type")
 	}
 
-	adapterName := ct[slashIdx+1:]
 	cfgAdapter := GetAdapter(adapterName)
 	if cfgAdapter == nil {
 		return nil, nil, fmt.Errorf("unrecognized config adapter '%s'", adapterName)
@@ -164,7 +224,7 @@ func adaptByContentType(contentType string, body []byte) ([]byte, []Warning, err
 }
 
 var bufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }

@@ -40,6 +40,11 @@ type NetWriter struct {
 	// The timeout to wait while connecting to the socket.
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
 
+	// If enabled, allow connections errors when first opening the
+	// writer. The error and subsequent log entries will be reported
+	// to stderr instead until a connection can be re-established.
+	SoftStart bool `json:"soft_start,omitempty"`
+
 	addr caddy.NetworkAddress
 }
 
@@ -92,7 +97,12 @@ func (nw NetWriter) OpenWriter() (io.WriteCloser, error) {
 	}
 	conn, err := reconn.dial()
 	if err != nil {
-		return nil, err
+		if !nw.SoftStart {
+			return nil, err
+		}
+		// don't block config load if remote is down or some other external problem;
+		// we can dump logs to stderr for now (see issue #5520)
+		fmt.Fprintf(os.Stderr, "[ERROR] net log writer failed to connect: %v (will retry connection and print errors here in the meantime)\n", err)
 	}
 	reconn.connMu.Lock()
 	reconn.Conn = conn
@@ -102,34 +112,42 @@ func (nw NetWriter) OpenWriter() (io.WriteCloser, error) {
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
 //
-//     net <address> {
-//         dial_timeout <duration>
-//     }
-//
+//	net <address> {
+//	    dial_timeout <duration>
+//	    soft_start
+//	}
 func (nw *NetWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		if !d.NextArg() {
-			return d.ArgErr()
-		}
-		nw.Address = d.Val()
-		if d.NextArg() {
-			return d.ArgErr()
-		}
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			switch d.Val() {
-			case "dial_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				timeout, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("invalid duration: %s", d.Val())
-				}
-				if d.NextArg() {
-					return d.ArgErr()
-				}
-				nw.DialTimeout = caddy.Duration(timeout)
+	d.Next() // consume writer name
+	if !d.NextArg() {
+		return d.ArgErr()
+	}
+	nw.Address = d.Val()
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "dial_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
 			}
+			timeout, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid duration: %s", d.Val())
+			}
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			nw.DialTimeout = caddy.Duration(timeout)
+
+		case "soft_start":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			nw.SoftStart = true
+
+		default:
+			return d.Errf("unrecognized subdirective '%s'", d.Val())
 		}
 	}
 	return nil
@@ -152,8 +170,10 @@ func (reconn *redialerConn) Write(b []byte) (n int, err error) {
 	reconn.connMu.RLock()
 	conn := reconn.Conn
 	reconn.connMu.RUnlock()
-	if n, err = conn.Write(b); err == nil {
-		return
+	if conn != nil {
+		if n, err = conn.Write(b); err == nil {
+			return n, err
+		}
 	}
 
 	// problem with the connection - lock it and try to fix it
@@ -162,8 +182,10 @@ func (reconn *redialerConn) Write(b []byte) (n int, err error) {
 
 	// if multiple concurrent writes failed on the same broken conn, then
 	// one of them might have already re-dialed by now; try writing again
-	if n, err = reconn.Conn.Write(b); err == nil {
-		return
+	if reconn.Conn != nil {
+		if n, err = reconn.Conn.Write(b); err == nil {
+			return n, err
+		}
 	}
 
 	// there's still a problem, so try to re-attempt dialing the socket
@@ -176,10 +198,12 @@ func (reconn *redialerConn) Write(b []byte) (n int, err error) {
 		if err2 != nil {
 			// logger socket still offline; instead of discarding the log, dump it to stderr
 			os.Stderr.Write(b)
-			return
+			return n, err
 		}
 		if n, err = conn2.Write(b); err == nil {
-			reconn.Conn.Close()
+			if reconn.Conn != nil {
+				reconn.Conn.Close()
+			}
 			reconn.Conn = conn2
 		}
 	} else {
@@ -187,7 +211,7 @@ func (reconn *redialerConn) Write(b []byte) (n int, err error) {
 		os.Stderr.Write(b)
 	}
 
-	return
+	return n, err
 }
 
 func (reconn *redialerConn) dial() (net.Conn, error) {

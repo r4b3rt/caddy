@@ -19,24 +19,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/caddyserver/certmagic"
+	"github.com/mholt/acmez/v3/acme"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"github.com/caddyserver/certmagic"
-	"github.com/mholt/acmez/acme"
 )
 
 func (st ServerType) buildTLSApp(
 	pairings []sbAddrAssociation,
-	options map[string]interface{},
+	options map[string]any,
 	warnings []caddyconfig.Warning,
 ) (*caddytls.TLS, []caddyconfig.Warning, error) {
-
 	tlsApp := &caddytls.TLS{CertificatesRaw: make(caddy.ModuleMap)}
 	var certLoaders []caddytls.CertificateLoader
 
@@ -44,29 +45,26 @@ func (st ServerType) buildTLSApp(
 	if hp, ok := options["http_port"].(int); ok {
 		httpPort = strconv.Itoa(hp)
 	}
-	httpsPort := strconv.Itoa(caddyhttp.DefaultHTTPSPort)
-	if hsp, ok := options["https_port"].(int); ok {
-		httpsPort = strconv.Itoa(hsp)
+	autoHTTPS := []string{}
+	if ah, ok := options["auto_https"].([]string); ok {
+		autoHTTPS = ah
 	}
 
-	// count how many server blocks have a TLS-enabled key with
-	// no host, and find all hosts that share a server block with
-	// a hostless key, so that they don't get forgotten/omitted
-	// by auto-HTTPS (since they won't appear in route matchers)
-	var serverBlocksWithTLSHostlessKey int
+	// find all hosts that share a server block with a hostless
+	// key, so that they don't get forgotten/omitted by auto-HTTPS
+	// (since they won't appear in route matchers)
 	httpsHostsSharedWithHostlessKey := make(map[string]struct{})
-	for _, pair := range pairings {
-		for _, sb := range pair.serverBlocks {
-			for _, addr := range sb.keys {
-				if addr.Host == "" {
-					// this address has no hostname, but if it's explicitly set
-					// to HTTPS, then we need to count it as being TLS-enabled
-					if addr.Scheme == "https" || addr.Port == httpsPort {
-						serverBlocksWithTLSHostlessKey++
+	if !slices.Contains(autoHTTPS, "off") {
+		for _, pair := range pairings {
+			for _, sb := range pair.serverBlocks {
+				for _, addr := range sb.parsedKeys {
+					if addr.Host != "" {
+						continue
 					}
+
 					// this server block has a hostless key, now
 					// go through and add all the hosts to the set
-					for _, otherAddr := range sb.keys {
+					for _, otherAddr := range sb.parsedKeys {
 						if otherAddr.Original == addr.Original {
 							continue
 						}
@@ -94,13 +92,25 @@ func (st ServerType) buildTLSApp(
 		tlsApp.Automation.Policies = append(tlsApp.Automation.Policies, catchAllAP)
 	}
 
+	forcedAutomatedNames := make(map[string]struct{}) // explicitly configured to be automated, even if covered by a wildcard
+
 	for _, p := range pairings {
 		// avoid setting up TLS automation policies for a server that is HTTP-only
-		if !listenersUseAnyPortOtherThan(p.addresses, httpPort) {
+		var addresses []string
+		for _, addressWithProtocols := range p.addressesWithProtocols {
+			addresses = append(addresses, addressWithProtocols.address)
+		}
+		if !listenersUseAnyPortOtherThan(addresses, httpPort) {
 			continue
 		}
 
 		for _, sblock := range p.serverBlocks {
+			// check the scheme of all the site addresses,
+			// skip building AP if they all had http://
+			if sblock.isAllHTTP() {
+				continue
+			}
+
 			// get values that populate an automation policy for this block
 			ap, err := newBaseAutomationPolicy(options, warnings, true)
 			if err != nil {
@@ -117,8 +127,26 @@ func (st ServerType) buildTLSApp(
 				ap.OnDemand = true
 			}
 
+			// collect hosts that are forced to have certs automated for their specific name
+			if _, ok := sblock.pile["tls.force_automate"]; ok {
+				for _, host := range sblockHosts {
+					forcedAutomatedNames[host] = struct{}{}
+				}
+			}
+
+			// reuse private keys tls
+			if _, ok := sblock.pile["tls.reuse_private_keys"]; ok {
+				ap.ReusePrivateKeys = true
+			}
+
 			if keyTypeVals, ok := sblock.pile["tls.key_type"]; ok {
 				ap.KeyType = keyTypeVals[0].Value.(string)
+			}
+
+			if renewalWindowRatioVals, ok := sblock.pile["tls.renewal_window_ratio"]; ok {
+				ap.RenewalWindowRatio = renewalWindowRatioVals[0].Value.(float64)
+			} else if globalRenewalWindowRatio, ok := options["renewal_window_ratio"]; ok {
+				ap.RenewalWindowRatio = globalRenewalWindowRatio.(float64)
 			}
 
 			// certificate issuers
@@ -128,6 +156,19 @@ func (st ServerType) buildTLSApp(
 					issuers = append(issuers, issuerVal.Value.(certmagic.Issuer))
 				}
 				if ap == catchAllAP && !reflect.DeepEqual(ap.Issuers, issuers) {
+					// this more correctly implements an error check that was removed
+					// below; try it with this config:
+					//
+					// :443 {
+					// 	bind 127.0.0.1
+					// }
+					//
+					// :443 {
+					// 	bind ::1
+					// 	tls {
+					// 		issuer acme
+					// 	}
+					// }
 					return nil, warnings, fmt.Errorf("automation policy from site block is also default/catch-all policy because of key without hostname, and the two are in conflict: %#v != %#v", ap.Issuers, issuers)
 				}
 				ap.Issuers = issuers
@@ -162,42 +203,40 @@ func (st ServerType) buildTLSApp(
 					if acmeIssuer.Challenges.BindHost == "" {
 						// only binding to one host is supported
 						var bindHost string
-						if bindHosts, ok := cfgVal.Value.([]string); ok && len(bindHosts) > 0 {
-							bindHost = bindHosts[0]
+						if asserted, ok := cfgVal.Value.(addressesWithProtocols); ok && len(asserted.addresses) > 0 {
+							bindHost = asserted.addresses[0]
 						}
 						acmeIssuer.Challenges.BindHost = bindHost
 					}
 				}
 			}
 
-			// first make sure this block is allowed to create an automation policy;
-			// doing so is forbidden if it has a key with no host (i.e. ":443")
+			// we used to ensure this block is allowed to create an automation policy;
+			// doing so was forbidden if it has a key with no host (i.e. ":443")
 			// and if there is a different server block that also has a key with no
 			// host -- since a key with no host matches any host, we need its
 			// associated automation policy to have an empty Subjects list, i.e. no
 			// host filter, which is indistinguishable between the two server blocks
 			// because automation is not done in the context of a particular server...
 			// this is an example of a poor mapping from Caddyfile to JSON but that's
-			// the least-leaky abstraction I could figure out
-			if len(sblockHosts) == 0 {
-				if serverBlocksWithTLSHostlessKey > 1 {
-					// this server block and at least one other has a key with no host,
-					// making the two indistinguishable; it is misleading to define such
-					// a policy within one server block since it actually will apply to
-					// others as well
-					return nil, warnings, fmt.Errorf("cannot make a TLS automation policy from a server block that has a host-less address when there are other TLS-enabled server block addresses lacking a host")
-				}
-				if catchAllAP == nil {
-					// this server block has a key with no hosts, but there is not yet
-					// a catch-all automation policy (probably because no global options
-					// were set), so this one becomes it
-					catchAllAP = ap
-				}
+			// the least-leaky abstraction I could figure out -- however, this check
+			// was preventing certain listeners, like those provided by plugins, from
+			// being used as desired (see the Tailscale listener plugin), so I removed
+			// the check: and I think since I originally wrote the check I added a new
+			// check above which *properly* detects this ambiguity without breaking the
+			// listener plugin; see the check above with a commented example config
+			if len(sblockHosts) == 0 && catchAllAP == nil {
+				// this server block has a key with no hosts, but there is not yet
+				// a catch-all automation policy (probably because no global options
+				// were set), so this one becomes it
+				catchAllAP = ap
 			}
 
+			hostsNotHTTP := sblock.hostsFromKeysNotHTTP(httpPort)
+			sort.Strings(hostsNotHTTP) // solely for deterministic test results
+
 			// associate our new automation policy with this server block's hosts
-			ap.Subjects = sblock.hostsFromKeysNotHTTP(httpPort)
-			sort.Strings(ap.Subjects) // solely for deterministic test results
+			ap.SubjectsRaw = hostsNotHTTP
 
 			// if a combination of public and internal names were given
 			// for this same server block and no issuer was specified, we
@@ -207,7 +246,11 @@ func (st ServerType) buildTLSApp(
 			var ap2 *caddytls.AutomationPolicy
 			if len(ap.Issuers) == 0 {
 				var internal, external []string
-				for _, s := range ap.Subjects {
+				for _, s := range ap.SubjectsRaw {
+					// do not create Issuers for Tailscale domains; they will be given a Manager instead
+					if isTailscaleDomain(s) {
+						continue
+					}
 					if !certmagic.SubjectQualifiesForCert(s) {
 						return nil, warnings, fmt.Errorf("subject does not qualify for certificate: '%s'", s)
 					}
@@ -225,13 +268,14 @@ func (st ServerType) buildTLSApp(
 					}
 				}
 				if len(external) > 0 && len(internal) > 0 {
-					ap.Subjects = external
+					ap.SubjectsRaw = external
 					apCopy := *ap
 					ap2 = &apCopy
-					ap2.Subjects = internal
+					ap2.SubjectsRaw = internal
 					ap2.IssuersRaw = []json.RawMessage{caddyconfig.JSONModuleObject(caddytls.InternalIssuer{}, "module", "internal", &warnings)}
 				}
 			}
+
 			if tlsApp.Automation == nil {
 				tlsApp.Automation = new(caddytls.AutomationConfig)
 			}
@@ -266,7 +310,7 @@ func (st ServerType) buildTLSApp(
 					combined = reflect.New(reflect.TypeOf(cl)).Elem()
 				}
 				clVal := reflect.ValueOf(cl)
-				for i := 0; i < clVal.Len(); i++ {
+				for i := range clVal.Len() {
 					combined = reflect.Append(combined, clVal.Index(i))
 				}
 				loadersByName[name] = combined.Interface().(caddytls.CertificateLoader)
@@ -285,6 +329,54 @@ func (st ServerType) buildTLSApp(
 		tlsApp.Automation.OnDemand = onDemand
 	}
 
+	// set up "global" (to the TLS app) DNS provider config
+	if globalDNS, ok := options["dns"]; ok && globalDNS != nil {
+		tlsApp.DNSRaw = caddyconfig.JSONModuleObject(globalDNS, "name", globalDNS.(caddy.Module).CaddyModule().ID.Name(), nil)
+	}
+
+	// set up "global" (to the TLS app) DNS resolvers config
+	if globalResolvers, ok := options["tls_resolvers"]; ok && globalResolvers != nil {
+		tlsApp.Resolvers = globalResolvers.([]string)
+	}
+
+	// set up ECH from Caddyfile options
+	if ech, ok := options["ech"].(*caddytls.ECH); ok {
+		tlsApp.EncryptedClientHello = ech
+
+		// outer server names will need certificates, so make sure they're included
+		// in an automation policy for them that applies any global options. A name
+		// that a site block's policy already covers keeps that policy, because a
+		// second policy for it would be rejected as ambiguous or picked ahead of
+		// the site's.
+		ap, err := newBaseAutomationPolicy(options, warnings, true)
+		if err != nil {
+			return nil, warnings, err
+		}
+		for _, cfg := range ech.Configs {
+			if cfg.PublicName == "" || automationPolicyCoversName(tlsApp.Automation, cfg.PublicName) {
+				continue
+			}
+			ap.SubjectsRaw = append(ap.SubjectsRaw, cfg.PublicName)
+		}
+		// without subjects, the policy would apply to every name as a catch-all
+		if len(ap.SubjectsRaw) > 0 {
+			if tlsApp.Automation == nil {
+				tlsApp.Automation = new(caddytls.AutomationConfig)
+			}
+			tlsApp.Automation.Policies = append(tlsApp.Automation.Policies, ap)
+		}
+	}
+
+	// if the storage clean interval is a boolean, then it's "off" to disable cleaning
+	if sc, ok := options["storage_check"].(string); ok && sc == "off" {
+		tlsApp.DisableStorageCheck = true
+	}
+
+	// if the storage clean interval is a boolean, then it's "off" to disable cleaning
+	if sci, ok := options["storage_clean_interval"].(bool); ok && !sci {
+		tlsApp.DisableStorageClean = true
+	}
+
 	// set the storage clean interval if configured
 	if storageCleanInterval, ok := options["storage_clean_interval"].(caddy.Duration); ok {
 		if tlsApp.Automation == nil {
@@ -299,6 +391,14 @@ func (st ServerType) buildTLSApp(
 			tlsApp.Automation = new(caddytls.AutomationConfig)
 		}
 		tlsApp.Automation.RenewCheckInterval = renewCheckInterval
+	}
+
+	// set the OCSP check interval if configured
+	if ocspCheckInterval, ok := options["ocsp_interval"].(caddy.Duration); ok {
+		if tlsApp.Automation == nil {
+			tlsApp.Automation = new(caddytls.AutomationConfig)
+		}
+		tlsApp.Automation.OCSPCheckInterval = ocspCheckInterval
 	}
 
 	// set whether OCSP stapling should be disabled for manually-managed certificates
@@ -317,16 +417,77 @@ func (st ServerType) buildTLSApp(
 	internalAP := &caddytls.AutomationPolicy{
 		IssuersRaw: []json.RawMessage{json.RawMessage(`{"module":"internal"}`)},
 	}
-	for h := range httpsHostsSharedWithHostlessKey {
-		al = append(al, h)
-		if !certmagic.SubjectQualifiesForPublicCert(h) {
-			internalAP.Subjects = append(internalAP.Subjects, h)
+	if !slices.Contains(autoHTTPS, "off") && !slices.Contains(autoHTTPS, "disable_certs") {
+		for h := range httpsHostsSharedWithHostlessKey {
+			al = append(al, h)
+			if !certmagic.SubjectQualifiesForPublicCert(h) {
+				internalAP.SubjectsRaw = append(internalAP.SubjectsRaw, h)
+			}
 		}
 	}
+	for name := range forcedAutomatedNames {
+		if slices.Contains(al, name) {
+			continue
+		}
+		al = append(al, name)
+	}
+	// names from the tls_automate_names global option are managed without a
+	// site block of their own, so that asking for a certificate does not also
+	// mean serving the name; like force_automate, an explicitly listed name is
+	// managed even where auto-HTTPS would not have chosen it. Names that cannot
+	// get a public certificate are given the internal issuer, the same
+	// treatment they would get from a site block.
+	if automateNames, ok := options["tls_automate_names"].([]string); ok {
+		var publicNames []string
+		for _, name := range automateNames {
+			if slices.Contains(al, name) {
+				continue
+			}
+			al = append(al, name)
+			// a name that a site block already wrote a policy for keeps that
+			// policy: it is more specific than anything the global options can
+			// say, and a second policy naming the same subject is ambiguous --
+			// adapting would fail outright. The name still belongs in the
+			// automate loader, since a site block served only over HTTP does
+			// not get its certificate managed by auto-HTTPS.
+			if automationPolicyExistsForSubject(tlsApp.Automation, name) {
+				continue
+			}
+			if certmagic.SubjectQualifiesForPublicCert(name) {
+				publicNames = append(publicNames, name)
+			} else {
+				internalAP.SubjectsRaw = append(internalAP.SubjectsRaw, name)
+			}
+		}
+		// the names still need an automation policy of their own, or they would
+		// miss the issuer configured by global options -- the catch-all policy
+		// that would otherwise carry it is dropped once every other policy
+		// names its subjects. Consolidation folds this back into an identical
+		// policy, so a name listed here ends up in the same place it would have
+		// had it been given a site block.
+		if len(publicNames) > 0 {
+			// only worth a policy if it would carry something: either global
+			// automation options, or ACME defaults filled in further below.
+			// Without either, the names are managed with the defaults anyway,
+			// and an empty policy would just be noise in the output.
+			ap, err := newBaseAutomationPolicy(options, warnings, hasGlobalACMEDefaults(options))
+			if err != nil {
+				return nil, warnings, err
+			}
+			if ap != nil {
+				ap.SubjectsRaw = publicNames
+				if tlsApp.Automation == nil {
+					tlsApp.Automation = new(caddytls.AutomationConfig)
+				}
+				tlsApp.Automation.Policies = append(tlsApp.Automation.Policies, ap)
+			}
+		}
+	}
+	slices.Sort(al) // to stabilize the adapt output
 	if len(al) > 0 {
 		tlsApp.CertificatesRaw["automate"] = caddyconfig.JSON(al, &warnings)
 	}
-	if len(internalAP.Subjects) > 0 {
+	if len(internalAP.SubjectsRaw) > 0 {
 		if tlsApp.Automation == nil {
 			tlsApp.Automation = new(caddytls.AutomationConfig)
 		}
@@ -338,27 +499,18 @@ func (st ServerType) buildTLSApp(
 	if tlsApp.Automation != nil {
 		globalEmail := options["email"]
 		globalACMECA := options["acme_ca"]
-		globalACMECARoot := options["acme_ca_root"]
-		globalACMEDNS := options["acme_dns"]
-		globalACMEEAB := options["acme_eab"]
-		globalPreferredChains := options["preferred_chains"]
-		hasGlobalACMEDefaults := globalEmail != nil || globalACMECA != nil || globalACMECARoot != nil || globalACMEDNS != nil || globalACMEEAB != nil || globalPreferredChains != nil
-		if hasGlobalACMEDefaults {
-			// for _, ap := range tlsApp.Automation.Policies {
-			for i := 0; i < len(tlsApp.Automation.Policies); i++ {
+		if hasGlobalACMEDefaults(options) {
+			for i := range tlsApp.Automation.Policies {
 				ap := tlsApp.Automation.Policies[i]
 				if len(ap.Issuers) == 0 && automationPolicyHasAllPublicNames(ap) {
 					// for public names, create default issuers which will later be filled in with configured global defaults
 					// (internal names will implicitly use the internal issuer at auto-https time)
-					ap.Issuers = caddytls.DefaultIssuers()
+					emailStr, _ := globalEmail.(string)
+					ap.Issuers = caddytls.DefaultIssuers(emailStr)
 
 					// if a specific endpoint is configured, can't use multiple default issuers
 					if globalACMECA != nil {
-						if strings.Contains(globalACMECA.(string), "zerossl") {
-							ap.Issuers = []certmagic.Issuer{&caddytls.ZeroSSLIssuer{ACMEIssuer: new(caddytls.ACMEIssuer)}}
-						} else {
-							ap.Issuers = []certmagic.Issuer{new(caddytls.ACMEIssuer)}
-						}
+						ap.Issuers = []certmagic.Issuer{new(caddytls.ACMEIssuer)}
 					}
 				}
 			}
@@ -393,7 +545,7 @@ func (st ServerType) buildTLSApp(
 		// for convenience)
 		automationHostSet := make(map[string]struct{})
 		for _, ap := range tlsApp.Automation.Policies {
-			for _, s := range ap.Subjects {
+			for _, s := range ap.SubjectsRaw {
 				if _, ok := automationHostSet[s]; ok {
 					return nil, warnings, fmt.Errorf("hostname appears in more than one automation policy, making certificate management ambiguous: %s", s)
 				}
@@ -415,7 +567,7 @@ func (st ServerType) buildTLSApp(
 
 type acmeCapable interface{ GetACMEIssuer() *caddytls.ACMEIssuer }
 
-func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]interface{}) error {
+func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]any) error {
 	acmeWrapper, ok := issuer.(acmeCapable)
 	if !ok {
 		return nil
@@ -428,9 +580,12 @@ func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]interf
 	globalEmail := options["email"]
 	globalACMECA := options["acme_ca"]
 	globalACMECARoot := options["acme_ca_root"]
-	globalACMEDNS := options["acme_dns"]
+	globalACMEDNS, globalACMEDNSok := options["acme_dns"] // can be set to nil (to use globally-defined "dns" value instead), but it is still set
 	globalACMEEAB := options["acme_eab"]
 	globalPreferredChains := options["preferred_chains"]
+	globalCertLifetime := options["cert_lifetime"]
+	globalHTTPPort, globalHTTPSPort := options["http_port"], options["https_port"]
+	globalDefaultBind := options["default_bind"]
 
 	if globalEmail != nil && acmeIssuer.Email == "" {
 		acmeIssuer.Email = globalEmail.(string)
@@ -438,14 +593,23 @@ func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]interf
 	if globalACMECA != nil && acmeIssuer.CA == "" {
 		acmeIssuer.CA = globalACMECA.(string)
 	}
-	if globalACMECARoot != nil && !sliceContains(acmeIssuer.TrustedRootsPEMFiles, globalACMECARoot.(string)) {
+	if globalACMECARoot != nil && !slices.Contains(acmeIssuer.TrustedRootsPEMFiles, globalACMECARoot.(string)) {
 		acmeIssuer.TrustedRootsPEMFiles = append(acmeIssuer.TrustedRootsPEMFiles, globalACMECARoot.(string))
 	}
-	if globalACMEDNS != nil && (acmeIssuer.Challenges == nil || acmeIssuer.Challenges.DNS == nil) {
-		acmeIssuer.Challenges = &caddytls.ChallengesConfig{
-			DNS: &caddytls.DNSChallengeConfig{
-				ProviderRaw: caddyconfig.JSONModuleObject(globalACMEDNS, "name", globalACMEDNS.(caddy.Module).CaddyModule().ID.Name(), nil),
-			},
+	if globalACMEDNSok && (acmeIssuer.Challenges == nil || acmeIssuer.Challenges.DNS == nil || acmeIssuer.Challenges.DNS.ProviderRaw == nil) {
+		globalDNS := options["dns"]
+		if globalDNS == nil && globalACMEDNS == nil {
+			return fmt.Errorf("acme_dns specified without DNS provider config, but no provider specified with 'dns' global option")
+		}
+		if acmeIssuer.Challenges == nil {
+			acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+		}
+		if acmeIssuer.Challenges.DNS == nil {
+			acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
+		}
+		if globalACMEDNS != nil && acmeIssuer.Challenges.DNS.ProviderRaw == nil {
+			// Set a global DNS provider if `acme_dns` is set
+			acmeIssuer.Challenges.DNS.ProviderRaw = caddyconfig.JSONModuleObject(globalACMEDNS, "name", globalACMEDNS.(caddy.Module).CaddyModule().ID.Name(), nil)
 		}
 	}
 	if globalACMEEAB != nil && acmeIssuer.ExternalAccount == nil {
@@ -454,7 +618,379 @@ func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]interf
 	if globalPreferredChains != nil && acmeIssuer.PreferredChains == nil {
 		acmeIssuer.PreferredChains = globalPreferredChains.(*caddytls.ChainPreference)
 	}
+	// only configure alt HTTP and TLS-ALPN ports if the DNS challenge is not enabled (wouldn't hurt, but isn't necessary since the DNS challenge is exclusive of others)
+	if globalHTTPPort != nil && (acmeIssuer.Challenges == nil || acmeIssuer.Challenges.DNS == nil) && (acmeIssuer.Challenges == nil || acmeIssuer.Challenges.HTTP == nil || acmeIssuer.Challenges.HTTP.AlternatePort == 0) {
+		if acmeIssuer.Challenges == nil {
+			acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+		}
+		if acmeIssuer.Challenges.HTTP == nil {
+			acmeIssuer.Challenges.HTTP = new(caddytls.HTTPChallengeConfig)
+		}
+		acmeIssuer.Challenges.HTTP.AlternatePort = globalHTTPPort.(int)
+	}
+	if globalHTTPSPort != nil && (acmeIssuer.Challenges == nil || acmeIssuer.Challenges.DNS == nil) && (acmeIssuer.Challenges == nil || acmeIssuer.Challenges.TLSALPN == nil || acmeIssuer.Challenges.TLSALPN.AlternatePort == 0) {
+		if acmeIssuer.Challenges == nil {
+			acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+		}
+		if acmeIssuer.Challenges.TLSALPN == nil {
+			acmeIssuer.Challenges.TLSALPN = new(caddytls.TLSALPNChallengeConfig)
+		}
+		acmeIssuer.Challenges.TLSALPN.AlternatePort = globalHTTPSPort.(int)
+	}
+	// If BindHost is still unset, fall back to the first default_bind address if set
+	// This avoids binding the automation policy to the wildcard socket, which is unexpected behavior when a more selective socket is specified via default_bind
+	// In BSD it is valid to bind to the wildcard socket even though a more selective socket is already open (still unexpected behavior by the caller though)
+	// In Linux the same call will error with EADDRINUSE whenever the listener for the automation policy is opened
+	if acmeIssuer.Challenges == nil || (acmeIssuer.Challenges.DNS == nil && acmeIssuer.Challenges.BindHost == "") {
+		if defBinds, ok := globalDefaultBind.([]ConfigValue); ok && len(defBinds) > 0 {
+			if abp, ok := defBinds[0].Value.(addressesWithProtocols); ok && len(abp.addresses) > 0 {
+				if acmeIssuer.Challenges == nil {
+					acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+				}
+				acmeIssuer.Challenges.BindHost = abp.addresses[0]
+			}
+		}
+	}
+	if globalCertLifetime != nil && acmeIssuer.CertificateLifetime == 0 {
+		acmeIssuer.CertificateLifetime = globalCertLifetime.(caddy.Duration)
+	}
+	// apply global resolvers if DNS challenge is configured and resolvers are not already set
+	globalResolvers := options["tls_resolvers"]
+	if globalResolvers != nil && acmeIssuer.Challenges != nil && acmeIssuer.Challenges.DNS != nil {
+		// Check if DNS challenge is actually configured
+		hasDNSChallenge := globalACMEDNSok || acmeIssuer.Challenges.DNS.ProviderRaw != nil
+		if hasDNSChallenge && len(acmeIssuer.Challenges.DNS.Resolvers) == 0 {
+			acmeIssuer.Challenges.DNS.Resolvers = globalResolvers.([]string)
+		}
+	}
 	return nil
+}
+
+// implicitACMEIssuers returns the issuers to use for ACME-related tls
+// shortcuts such as ca, ca_root, and dns. If any global cert_issuer options
+// configure ACME issuers, those become the templates for the local shortcut
+// configuration; otherwise, default ACME issuers are used.
+func implicitACMEIssuers(h Helper, acmeIssuer *caddytls.ACMEIssuer) []certmagic.Issuer {
+	globalIssuers, _ := h.Option("cert_issuer").([]certmagic.Issuer)
+
+	var implicitIssuers []certmagic.Issuer
+	for _, issuer := range globalIssuers {
+		acmeWrapper, ok := issuer.(acmeCapable)
+		if !ok {
+			continue
+		}
+		baseIssuer := acmeWrapper.GetACMEIssuer()
+		if baseIssuer == nil {
+			continue
+		}
+		implicitIssuers = append(implicitIssuers, mergeACMEIssuers(baseIssuer, acmeIssuer))
+	}
+	if len(implicitIssuers) > 0 {
+		return implicitIssuers
+	}
+
+	// If an ACME CA endpoint was set locally, the user expects to use only that
+	// CA rather than the usual default fallback issuers.
+	defaultIssuers := caddytls.DefaultIssuers(acmeIssuer.Email)
+	if acmeIssuer.CA != "" {
+		defaultIssuers = []certmagic.Issuer{new(caddytls.ACMEIssuer)}
+	}
+
+	implicitIssuers = make([]certmagic.Issuer, 0, len(defaultIssuers))
+	for _, issuer := range defaultIssuers {
+		acmeWrapper, ok := issuer.(acmeCapable)
+		if !ok {
+			implicitIssuers = append(implicitIssuers, issuer)
+			continue
+		}
+		baseIssuer := acmeWrapper.GetACMEIssuer()
+		if baseIssuer == nil {
+			implicitIssuers = append(implicitIssuers, issuer)
+			continue
+		}
+		implicitIssuers = append(implicitIssuers, mergeACMEIssuers(baseIssuer, acmeIssuer))
+	}
+	return implicitIssuers
+}
+
+func mergeACMEIssuers(base, overrides *caddytls.ACMEIssuer) *caddytls.ACMEIssuer {
+	if base == nil {
+		return cloneACMEIssuer(overrides)
+	}
+
+	merged := cloneACMEIssuer(base)
+	if overrides == nil {
+		return merged
+	}
+
+	if overrides.CA != "" {
+		merged.CA = overrides.CA
+	}
+	if overrides.TestCA != "" {
+		merged.TestCA = overrides.TestCA
+	}
+	if overrides.Email != "" {
+		merged.Email = overrides.Email
+	}
+	if overrides.Profile != "" {
+		merged.Profile = overrides.Profile
+	}
+	if overrides.AccountKey != "" {
+		merged.AccountKey = overrides.AccountKey
+	}
+	if overrides.ExternalAccount != nil {
+		merged.ExternalAccount = cloneACMEEAB(overrides.ExternalAccount)
+	}
+	if overrides.ACMETimeout != 0 {
+		merged.ACMETimeout = overrides.ACMETimeout
+	}
+	if len(overrides.TrustedRootsPEMFiles) > 0 {
+		merged.TrustedRootsPEMFiles = appendUniqueStrings(merged.TrustedRootsPEMFiles, overrides.TrustedRootsPEMFiles...)
+	}
+	if overrides.PreferredChains != nil {
+		merged.PreferredChains = cloneChainPreference(overrides.PreferredChains)
+	}
+	if overrides.CertificateLifetime != 0 {
+		merged.CertificateLifetime = overrides.CertificateLifetime
+	}
+	if len(overrides.NetworkProxyRaw) > 0 {
+		merged.NetworkProxyRaw = slices.Clone(overrides.NetworkProxyRaw)
+	}
+	merged.Challenges = mergeChallengesConfig(merged.Challenges, overrides.Challenges)
+
+	return merged
+}
+
+func mergeChallengesConfig(base, overrides *caddytls.ChallengesConfig) *caddytls.ChallengesConfig {
+	if base == nil {
+		return cloneChallengesConfig(overrides)
+	}
+	merged := cloneChallengesConfig(base)
+	if overrides == nil {
+		return merged
+	}
+
+	merged.HTTP = mergeHTTPChallengeConfig(merged.HTTP, overrides.HTTP)
+	merged.TLSALPN = mergeTLSALPNChallengeConfig(merged.TLSALPN, overrides.TLSALPN)
+	merged.DNS = mergeDNSChallengeConfig(merged.DNS, overrides.DNS)
+	if overrides.BindHost != "" {
+		merged.BindHost = overrides.BindHost
+	}
+	if overrides.Distributed != nil {
+		value := *overrides.Distributed
+		merged.Distributed = &value
+	}
+
+	return merged
+}
+
+func mergeHTTPChallengeConfig(base, overrides *caddytls.HTTPChallengeConfig) *caddytls.HTTPChallengeConfig {
+	if base == nil {
+		return cloneHTTPChallengeConfig(overrides)
+	}
+	merged := cloneHTTPChallengeConfig(base)
+	if overrides == nil {
+		return merged
+	}
+
+	if overrides.Disabled {
+		merged.Disabled = true
+	}
+	if overrides.AlternatePort != 0 {
+		merged.AlternatePort = overrides.AlternatePort
+	}
+
+	return merged
+}
+
+func mergeTLSALPNChallengeConfig(base, overrides *caddytls.TLSALPNChallengeConfig) *caddytls.TLSALPNChallengeConfig {
+	if base == nil {
+		return cloneTLSALPNChallengeConfig(overrides)
+	}
+	merged := cloneTLSALPNChallengeConfig(base)
+	if overrides == nil {
+		return merged
+	}
+
+	if overrides.Disabled {
+		merged.Disabled = true
+	}
+	if overrides.AlternatePort != 0 {
+		merged.AlternatePort = overrides.AlternatePort
+	}
+
+	return merged
+}
+
+func mergeDNSChallengeConfig(base, overrides *caddytls.DNSChallengeConfig) *caddytls.DNSChallengeConfig {
+	if base == nil {
+		return cloneDNSChallengeConfig(overrides)
+	}
+	merged := cloneDNSChallengeConfig(base)
+	if overrides == nil {
+		return merged
+	}
+
+	if len(overrides.ProviderRaw) > 0 {
+		merged.ProviderRaw = slices.Clone(overrides.ProviderRaw)
+	}
+	if overrides.PropagationDelay != 0 {
+		merged.PropagationDelay = overrides.PropagationDelay
+	}
+	if overrides.PropagationTimeout != 0 {
+		merged.PropagationTimeout = overrides.PropagationTimeout
+	}
+	if overrides.Resolvers != nil {
+		merged.Resolvers = slices.Clone(overrides.Resolvers)
+	}
+	if overrides.OverrideDomain != "" {
+		merged.OverrideDomain = overrides.OverrideDomain
+	}
+	if overrides.TTL != 0 {
+		merged.TTL = overrides.TTL
+	}
+
+	return merged
+}
+
+func cloneACMEIssuer(iss *caddytls.ACMEIssuer) *caddytls.ACMEIssuer {
+	if iss == nil {
+		return nil
+	}
+
+	cloned := *iss
+	cloned.Challenges = cloneChallengesConfig(iss.Challenges)
+	cloned.ExternalAccount = cloneACMEEAB(iss.ExternalAccount)
+	cloned.TrustedRootsPEMFiles = slices.Clone(iss.TrustedRootsPEMFiles)
+	cloned.PreferredChains = cloneChainPreference(iss.PreferredChains)
+	cloned.NetworkProxyRaw = slices.Clone(iss.NetworkProxyRaw)
+
+	return &cloned
+}
+
+func cloneChallengesConfig(cfg *caddytls.ChallengesConfig) *caddytls.ChallengesConfig {
+	if cfg == nil {
+		return nil
+	}
+
+	cloned := *cfg
+	cloned.HTTP = cloneHTTPChallengeConfig(cfg.HTTP)
+	cloned.TLSALPN = cloneTLSALPNChallengeConfig(cfg.TLSALPN)
+	cloned.DNS = cloneDNSChallengeConfig(cfg.DNS)
+	if cfg.Distributed != nil {
+		value := *cfg.Distributed
+		cloned.Distributed = &value
+	}
+
+	return &cloned
+}
+
+func cloneHTTPChallengeConfig(cfg *caddytls.HTTPChallengeConfig) *caddytls.HTTPChallengeConfig {
+	if cfg == nil {
+		return nil
+	}
+
+	cloned := *cfg
+	return &cloned
+}
+
+func cloneTLSALPNChallengeConfig(cfg *caddytls.TLSALPNChallengeConfig) *caddytls.TLSALPNChallengeConfig {
+	if cfg == nil {
+		return nil
+	}
+
+	cloned := *cfg
+	return &cloned
+}
+
+func cloneDNSChallengeConfig(cfg *caddytls.DNSChallengeConfig) *caddytls.DNSChallengeConfig {
+	if cfg == nil {
+		return nil
+	}
+
+	cloned := *cfg
+	cloned.ProviderRaw = slices.Clone(cfg.ProviderRaw)
+	cloned.Resolvers = slices.Clone(cfg.Resolvers)
+
+	return &cloned
+}
+
+func cloneACMEEAB(eab *acme.EAB) *acme.EAB {
+	if eab == nil {
+		return nil
+	}
+
+	cloned := *eab
+	return &cloned
+}
+
+func cloneChainPreference(pref *caddytls.ChainPreference) *caddytls.ChainPreference {
+	if pref == nil {
+		return nil
+	}
+
+	cloned := *pref
+	cloned.RootCommonName = slices.Clone(pref.RootCommonName)
+	cloned.AnyCommonName = slices.Clone(pref.AnyCommonName)
+	if pref.Smallest != nil {
+		value := *pref.Smallest
+		cloned.Smallest = &value
+	}
+
+	return &cloned
+}
+
+func appendUniqueStrings(existing []string, additions ...string) []string {
+	for _, value := range additions {
+		if !slices.Contains(existing, value) {
+			existing = append(existing, value)
+		}
+	}
+	return existing
+}
+
+// automationPolicyExistsForSubject reports whether some automation policy
+// already names subject. Subjects are compared exactly, which is the same
+// comparison the adapter uses to reject overlapping policies; a catch-all
+// policy names no subjects and so never matches.
+func automationPolicyExistsForSubject(automation *caddytls.AutomationConfig, subject string) bool {
+	if automation == nil {
+		return false
+	}
+	return slices.ContainsFunc(automation.Policies, func(ap *caddytls.AutomationPolicy) bool {
+		return slices.Contains(ap.SubjectsRaw, subject)
+	})
+}
+
+// automationPolicyCoversName reports whether some automation policy with
+// subjects would be selected for the ECH public name at runtime. The TLS app
+// trims and lowercases public names, then picks a policy for each one with
+// certmagic.MatchWildcard, so a wildcard or differently cased subject covers
+// it too. A catch-all policy names no subjects and so never matches.
+func automationPolicyCoversName(automation *caddytls.AutomationConfig, publicName string) bool {
+	if automation == nil {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSpace(publicName))
+	return slices.ContainsFunc(automation.Policies, func(ap *caddytls.AutomationPolicy) bool {
+		return slices.ContainsFunc(ap.SubjectsRaw, func(subj string) bool {
+			return certmagic.MatchWildcard(name, subj)
+		})
+	})
+}
+
+// hasGlobalACMEDefaults reports whether any global option is set that an
+// automation policy without issuers of its own would later be filled in with.
+// A policy is worth creating for a subject when this is true, even if the
+// policy is otherwise empty at the time it is made.
+func hasGlobalACMEDefaults(options map[string]any) bool {
+	_, hasACMEDNS := options["acme_dns"] // can be set to nil (to use globally-defined "dns" value instead), but it is still set
+	return options["email"] != nil ||
+		options["acme_ca"] != nil ||
+		options["acme_ca_root"] != nil ||
+		hasACMEDNS ||
+		options["acme_eab"] != nil ||
+		options["preferred_chains"] != nil
 }
 
 // newBaseAutomationPolicy returns a new TLS automation policy that gets
@@ -462,17 +998,28 @@ func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]interf
 // for any other automation policies. A nil policy (and no error) will be
 // returned if there are no default/global options. However, if always is
 // true, a non-nil value will always be returned (unless there is an error).
-func newBaseAutomationPolicy(options map[string]interface{}, warnings []caddyconfig.Warning, always bool) (*caddytls.AutomationPolicy, error) {
+func newBaseAutomationPolicy(
+	options map[string]any,
+	_ []caddyconfig.Warning,
+	always bool,
+) (*caddytls.AutomationPolicy, error) {
 	issuers, hasIssuers := options["cert_issuer"]
 	_, hasLocalCerts := options["local_certs"]
 	keyType, hasKeyType := options["key_type"]
 	ocspStapling, hasOCSPStapling := options["ocsp_stapling"]
+	renewalWindowRatio, hasRenewalWindowRatio := options["renewal_window_ratio"]
+	hasGlobalAutomationOpts := hasIssuers || hasLocalCerts || hasKeyType || hasOCSPStapling || hasRenewalWindowRatio
 
-	hasGlobalAutomationOpts := hasIssuers || hasLocalCerts || hasKeyType || hasOCSPStapling
+	globalACMECA := options["acme_ca"]
+	globalACMECARoot := options["acme_ca_root"]
+	_, globalACMEDNS := options["acme_dns"] // can be set to nil (to use globally-defined "dns" value instead), but it is still set
+	globalACMEEAB := options["acme_eab"]
+	globalPreferredChains := options["preferred_chains"]
+	hasGlobalACMEDefaults := globalACMECA != nil || globalACMECARoot != nil || globalACMEDNS || globalACMEEAB != nil || globalPreferredChains != nil
 
 	// if there are no global options related to automation policies
 	// set, then we can just return right away
-	if !hasGlobalAutomationOpts {
+	if !hasGlobalAutomationOpts && !hasGlobalACMEDefaults {
 		if always {
 			return new(caddytls.AutomationPolicy), nil
 		}
@@ -494,10 +1041,22 @@ func newBaseAutomationPolicy(options map[string]interface{}, warnings []caddycon
 		ap.Issuers = []certmagic.Issuer{new(caddytls.InternalIssuer)}
 	}
 
+	if hasGlobalACMEDefaults {
+		for i := range ap.Issuers {
+			if err := fillInGlobalACMEDefaults(ap.Issuers[i], options); err != nil {
+				return nil, fmt.Errorf("filling in global issuer defaults for issuer %d: %v", i, err)
+			}
+		}
+	}
+
 	if hasOCSPStapling {
 		ocspConfig := ocspStapling.(certmagic.OCSPConfig)
 		ap.DisableOCSPStapling = ocspConfig.DisableStapling
 		ap.OCSPOverrides = ocspConfig.ResponderOverrides
+	}
+
+	if hasRenewalWindowRatio {
+		ap.RenewalWindowRatio = renewalWindowRatio.(float64)
 	}
 
 	return ap, nil
@@ -514,21 +1073,38 @@ func consolidateAutomationPolicies(aps []*caddytls.AutomationPolicy) []*caddytls
 		if automationPolicyIsSubset(aps[j], aps[i]) {
 			return false
 		}
-		return len(aps[i].Subjects) > len(aps[j].Subjects)
+		return len(aps[i].SubjectsRaw) > len(aps[j].SubjectsRaw)
 	})
 
 	emptyAPCount := 0
 	origLenAPs := len(aps)
 	// compute the number of empty policies (disregarding subjects) - see #4128
+	// while we're at it,
 	emptyAP := new(caddytls.AutomationPolicy)
 	for i := 0; i < len(aps); i++ {
-		emptyAP.Subjects = aps[i].Subjects
+		emptyAP.SubjectsRaw = aps[i].SubjectsRaw
+		emptyAP.ManagersRaw = nil
 		if reflect.DeepEqual(aps[i], emptyAP) {
+			// AP is empty
 			emptyAPCount++
-			if !automationPolicyHasAllPublicNames(aps[i]) {
-				// if this automation policy has internal names, we might as well remove it
-				// so auto-https can implicitly use the internal issuer
-				aps = append(aps[:i], aps[i+1:]...)
+
+			// see if this AP shadows something later
+			shadowIdx := automationPolicyShadows(i, aps)
+			emptyAP.SubjectsRaw = nil
+			if shadowIdx >= 0 {
+				emptyAP.SubjectsRaw = aps[shadowIdx].SubjectsRaw
+				// allow the later policy, which is likely for a wildcard, to have cert
+				// managers ("get_certificate"), since wildcards now cover specific
+				// subdomains by default, when configured (see discussion in #7559)
+				emptyAP.ManagersRaw = aps[shadowIdx].ManagersRaw
+			}
+
+			// if this is the last AP, we can delete it, since auto-https should
+			// pick it up; if it shadows something later that is also empty, we
+			// can similarly delete this; but if it shadows something that is NOT
+			// empty, we must not delete it since the shadowing has a purpose
+			if i == len(aps)-1 || (shadowIdx >= 0 && reflect.DeepEqual(aps[shadowIdx], emptyAP)) {
+				aps = slices.Delete(aps, i, i+1)
 				i--
 			}
 		}
@@ -545,7 +1121,7 @@ outer:
 		for j := i + 1; j < len(aps); j++ {
 			// if they're exactly equal in every way, just keep one of them
 			if reflect.DeepEqual(aps[i], aps[j]) {
-				aps = append(aps[:j], aps[j+1:]...)
+				aps = slices.Delete(aps, j, j+1)
 				// must re-evaluate current i against next j; can't skip it!
 				// even if i decrements to -1, will be incremented to 0 immediately
 				i--
@@ -558,13 +1134,15 @@ outer:
 			// otherwise the one without any subjects (a catch-all) would be
 			// eaten up by the one with subjects; and if both have subjects, we
 			// need to combine their lists
-			if reflect.DeepEqual(aps[i].IssuersRaw, aps[j].IssuersRaw) &&
+			if automationPoliciesHaveSameIssuers(aps[i], aps[j]) &&
+				reflect.DeepEqual(aps[i].ManagersRaw, aps[j].ManagersRaw) &&
 				bytes.Equal(aps[i].StorageRaw, aps[j].StorageRaw) &&
 				aps[i].MustStaple == aps[j].MustStaple &&
 				aps[i].KeyType == aps[j].KeyType &&
 				aps[i].OnDemand == aps[j].OnDemand &&
+				aps[i].ReusePrivateKeys == aps[j].ReusePrivateKeys &&
 				aps[i].RenewalWindowRatio == aps[j].RenewalWindowRatio {
-				if len(aps[i].Subjects) > 0 && len(aps[j].Subjects) == 0 {
+				if len(aps[i].SubjectsRaw) > 0 && len(aps[j].SubjectsRaw) == 0 {
 					// later policy (at j) has no subjects ("catch-all"), so we can
 					// remove the identical-but-more-specific policy that comes first
 					// AS LONG AS it is not shadowed by another policy before it; e.g.
@@ -573,18 +1151,19 @@ outer:
 					// cause example.com to be served by the less specific policy for
 					// '*.com', which might be different (yes we've seen this happen)
 					if automationPolicyShadows(i, aps) >= j {
-						aps = append(aps[:i], aps[i+1:]...)
+						aps = slices.Delete(aps, i, i+1)
 						i--
 						continue outer
 					}
-				} else {
+				} else if !automationPolicyMergeShadows(i, j, aps) {
+					// merge only if it won't change which policy handles a name
 					// avoid repeated subjects
-					for _, subj := range aps[j].Subjects {
-						if !sliceContains(aps[i].Subjects, subj) {
-							aps[i].Subjects = append(aps[i].Subjects, subj)
+					for _, subj := range aps[j].SubjectsRaw {
+						if !slices.Contains(aps[i].SubjectsRaw, subj) {
+							aps[i].SubjectsRaw = append(aps[i].SubjectsRaw, subj)
 						}
 					}
-					aps = append(aps[:j], aps[j+1:]...)
+					aps = slices.Delete(aps, j, j+1)
 					j--
 				}
 			}
@@ -597,20 +1176,16 @@ outer:
 // automationPolicyIsSubset returns true if a's subjects are a subset
 // of b's subjects.
 func automationPolicyIsSubset(a, b *caddytls.AutomationPolicy) bool {
-	if len(b.Subjects) == 0 {
+	if len(b.SubjectsRaw) == 0 {
 		return true
 	}
-	if len(a.Subjects) == 0 {
+	if len(a.SubjectsRaw) == 0 {
 		return false
 	}
-	for _, aSubj := range a.Subjects {
-		var inSuperset bool
-		for _, bSubj := range b.Subjects {
-			if certmagic.MatchWildcard(aSubj, bSubj) {
-				inSuperset = true
-				break
-			}
-		}
+	for _, aSubj := range a.SubjectsRaw {
+		inSuperset := slices.ContainsFunc(b.SubjectsRaw, func(bSubj string) bool {
+			return certmagic.MatchWildcard(aSubj, bSubj)
+		})
 		if !inSuperset {
 			return false
 		}
@@ -633,20 +1208,115 @@ func automationPolicyShadows(i int, aps []*caddytls.AutomationPolicy) int {
 	return -1
 }
 
+// automationPolicyMergeShadows returns true if merging aps[j] into aps[i]
+// (where i < j) would change which policy handles a name. This happens
+// when a subject of a policy between i and j overlaps with a subject of
+// aps[j], in either direction.
+//
+// For example, say the policies are for "example.com" (i),
+// "foo.example.com" (i+1), and "*.example.com" (j). Merging j into i moves
+// "*.example.com" before the i+1 policy. Then the wildcard matches
+// "foo.example.com" first, and the i+1 policy is never used.
+//
+// The reverse case matters too. If the wildcard is in i+1 and the name is
+// in j, merging moves the name before the wildcard, and its policy changes.
+// A merge should not change the result, so it is skipped here as well.
+//
+// This uses certmagic.MatchWildcard, which the TLS app also uses to pick
+// a policy for a name.
+func automationPolicyMergeShadows(i, j int, aps []*caddytls.AutomationPolicy) bool {
+	for k := i + 1; k < j; k++ {
+		for _, kSubj := range aps[k].SubjectsRaw {
+			for _, jSubj := range aps[j].SubjectsRaw {
+				if certmagic.MatchWildcard(kSubj, jSubj) ||
+					certmagic.MatchWildcard(jSubj, kSubj) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // subjectQualifiesForPublicCert is like certmagic.SubjectQualifiesForPublicCert() except
 // that this allows domains with multiple wildcard levels like '*.*.example.com' to qualify
 // if the automation policy has OnDemand enabled (i.e. this function is more lenient).
+//
+// IP subjects are considered as non-qualifying for public certs. Technically, there are
+// now public ACME CAs as well as non-ACME CAs that issue IP certificates. But this function
+// is used solely for implicit automation (defaults), where it gets really complicated to
+// keep track of which issuers support IP certificates in which circumstances. Currently,
+// issuers that support IP certificates are very few, and all require some sort of config
+// from the user anyway (such as an account credential). Since we cannot implicitly and
+// automatically get public IP certs without configuration from the user, we treat IPs as
+// not qualifying for public certificates. Users should expressly configure an issuer
+// that supports IP certs for that purpose.
 func subjectQualifiesForPublicCert(ap *caddytls.AutomationPolicy, subj string) bool {
 	return !certmagic.SubjectIsIP(subj) &&
 		!certmagic.SubjectIsInternal(subj) &&
 		(strings.Count(subj, "*.") < 2 || ap.OnDemand)
 }
 
-func automationPolicyHasAllPublicNames(ap *caddytls.AutomationPolicy) bool {
-	for _, subj := range ap.Subjects {
-		if !subjectQualifiesForPublicCert(ap, subj) {
-			return false
-		}
+func automationPoliciesHaveSameIssuers(a, b *caddytls.AutomationPolicy) bool {
+	if reflect.DeepEqual(a.IssuersRaw, b.IssuersRaw) {
+		return automationPoliciesHaveCompatibleImplicitIssuers(a, b)
 	}
-	return true
+	return automationPolicyUsesDefaultInternalIssuer(a) && automationPolicyUsesDefaultInternalIssuer(b)
+}
+
+func automationPolicyUsesDefaultInternalIssuer(ap *caddytls.AutomationPolicy) bool {
+	if len(ap.IssuersRaw) == 0 && len(ap.Issuers) == 0 {
+		return automationPolicyImplicitIssuerClass(ap) == "internal"
+	}
+	return len(ap.IssuersRaw) == 1 &&
+		len(ap.Issuers) == 0 &&
+		string(bytes.TrimSpace(ap.IssuersRaw[0])) == `{"module":"internal"}`
+}
+
+// automationPoliciesHaveCompatibleImplicitIssuers returns whether two policies
+// without explicit issuers can be consolidated without changing default issuer
+// selection for their subjects.
+func automationPoliciesHaveCompatibleImplicitIssuers(a, b *caddytls.AutomationPolicy) bool {
+	if len(a.IssuersRaw) > 0 || len(a.Issuers) > 0 ||
+		len(b.IssuersRaw) > 0 || len(b.Issuers) > 0 {
+		return true
+	}
+
+	aClass := automationPolicyImplicitIssuerClass(a)
+	bClass := automationPolicyImplicitIssuerClass(b)
+	return aClass == "catch-all" || bClass == "catch-all" || aClass == bClass
+}
+
+func automationPolicyImplicitIssuerClass(ap *caddytls.AutomationPolicy) string {
+	if len(ap.SubjectsRaw) == 0 {
+		return "catch-all"
+	}
+
+	hasPublic := slices.ContainsFunc(ap.SubjectsRaw, func(subj string) bool {
+		return subjectQualifiesForPublicCert(ap, subj)
+	})
+	hasInternal := slices.ContainsFunc(ap.SubjectsRaw, func(subj string) bool {
+		return !subjectQualifiesForPublicCert(ap, subj)
+	})
+
+	switch {
+	case hasPublic && hasInternal:
+		return "mixed"
+	case hasPublic:
+		return "public"
+	default:
+		return "internal"
+	}
+}
+
+// automationPolicyHasAllPublicNames returns true if all the names on the policy
+// do NOT qualify for public certs OR are tailscale domains.
+func automationPolicyHasAllPublicNames(ap *caddytls.AutomationPolicy) bool {
+	return !slices.ContainsFunc(ap.SubjectsRaw, func(i string) bool {
+		return !subjectQualifiesForPublicCert(ap, i) || isTailscaleDomain(i)
+	})
+}
+
+func isTailscaleDomain(name string) bool {
+	return strings.HasSuffix(strings.ToLower(name), ".ts.net")
 }

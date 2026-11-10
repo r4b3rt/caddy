@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -26,6 +27,9 @@ type Tracing struct {
 	// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span
 	SpanName string `json:"span"`
 
+	// SpanAttributes are custom key-value pairs to be added to spans
+	SpanAttributes map[string]string `json:"span_attributes,omitempty"`
+
 	// otel implements opentelemetry related logic.
 	otel openTelemetryWrapper
 
@@ -42,10 +46,10 @@ func (Tracing) CaddyModule() caddy.ModuleInfo {
 
 // Provision implements caddy.Provisioner.
 func (ot *Tracing) Provision(ctx caddy.Context) error {
-	ot.logger = ctx.Logger(ot)
+	ot.logger = ctx.Logger()
 
 	var err error
-	ot.otel, err = newOpenTelemetryWrapper(ctx, ot.SpanName)
+	ot.otel, err = newOpenTelemetryWrapper(ctx, ot.SpanName, ot.SpanAttributes)
 
 	return err
 }
@@ -66,10 +70,13 @@ func (ot *Tracing) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 // UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:
 //
-//     tracing {
-//         [span <span_name>]
-//     }
-//
+//	tracing {
+//	    [span <span_name>]
+//		[span_attributes {
+//			attr1 value1
+//			attr2 value2
+//		}]
+//	}
 func (ot *Tracing) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	setParameter := func(d *caddyfile.Dispenser, val *string) error {
 		if d.NextArg() {
@@ -88,13 +95,29 @@ func (ot *Tracing) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		"span": &ot.SpanName,
 	}
 
-	for d.Next() {
-		args := d.RemainingArgs()
-		if len(args) > 0 {
-			return d.ArgErr()
-		}
+	d.Next() // consume directive name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
-		for d.NextBlock(0) {
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "span_attributes":
+			if ot.SpanAttributes == nil {
+				ot.SpanAttributes = make(map[string]string)
+			}
+			for d.NextBlock(1) {
+				key := d.Val()
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				value := d.Val()
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+				ot.SpanAttributes[key] = value
+			}
+		default:
 			if dst, ok := paramsMap[d.Val()]; ok {
 				if err := setParameter(d, dst); err != nil {
 					return err

@@ -19,20 +19,36 @@ import (
 	"net/http"
 	"strings"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
-	"go.uber.org/zap"
 )
 
 func init() {
 	caddy.RegisterModule(Handler{})
 }
 
-// Handler is a middleware for manipulating the request body.
+// Handler is a middleware for HTTP/2 server push. Note that
+// HTTP/2 server push has been deprecated by some clients and
+// its use is discouraged unless you can accurately predict
+// which resources actually need to be pushed to the client;
+// it can be difficult to know what the client already has
+// cached. Pushing unnecessary resources results in worse
+// performance. Consider using HTTP 103 Early Hints instead.
+//
+// This handler supports pushing from Link headers; in other
+// words, if the eventual response has Link headers, this
+// handler will push the resources indicated by those headers,
+// even without specifying any resources in its config.
 type Handler struct {
-	Resources []Resource    `json:"resources,omitempty"`
-	Headers   *HeaderConfig `json:"headers,omitempty"`
+	// The resources to push.
+	Resources []Resource `json:"resources,omitempty"`
+
+	// Headers to modify for the push requests.
+	Headers *HeaderConfig `json:"headers,omitempty"`
 
 	logger *zap.Logger
 }
@@ -47,7 +63,7 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up h.
 func (h *Handler) Provision(ctx caddy.Context) error {
-	h.logger = ctx.Logger(h)
+	h.logger = ctx.Logger()
 	if h.Headers != nil {
 		err := h.Headers.Provision(ctx)
 		if err != nil {
@@ -77,14 +93,17 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 
 	// push first!
 	for _, resource := range h.Resources {
-		h.logger.Debug("pushing resource",
-			zap.String("uri", r.RequestURI),
-			zap.String("push_method", resource.Method),
-			zap.String("push_target", resource.Target),
-			zap.Object("push_headers", caddyhttp.LoggableHTTPHeader{
-				Header:               hdr,
-				ShouldLogCredentials: shouldLogCredentials,
-			}))
+		if c := h.logger.Check(zapcore.DebugLevel, "pushing resource"); c != nil {
+			c.Write(
+				zap.String("uri", r.RequestURI),
+				zap.String("push_method", resource.Method),
+				zap.String("push_target", resource.Target),
+				zap.Object("push_headers", caddyhttp.LoggableHTTPHeader{
+					Header:               hdr,
+					ShouldLogCredentials: shouldLogCredentials,
+				}),
+			)
+		}
 		err := pusher.Push(repl.ReplaceAll(resource.Target, "."), &http.PushOptions{
 			Method: resource.Method,
 			Header: hdr,
@@ -194,7 +213,9 @@ func (lp linkPusher) WriteHeader(statusCode int) {
 	if links, ok := lp.ResponseWriter.Header()["Link"]; ok {
 		// only initiate these pushes if it hasn't been done yet
 		if val := caddyhttp.GetVar(lp.request.Context(), pushedLink); val == nil {
-			lp.handler.logger.Debug("pushing Link resources", zap.Strings("linked", links))
+			if c := lp.handler.logger.Check(zapcore.DebugLevel, "pushing Link resources"); c != nil {
+				c.Write(zap.Strings("linked", links))
+			}
 			caddyhttp.SetVar(lp.request.Context(), pushedLink, true)
 			lp.handler.servePreloadLinks(lp.pusher, lp.header, links)
 		}
@@ -237,5 +258,6 @@ const pushedLink = "http.handlers.push.pushed_link"
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
-	_ caddyhttp.HTTPInterfaces    = (*linkPusher)(nil)
+	_ http.ResponseWriter         = (*linkPusher)(nil)
+	_ http.Pusher                 = (*linkPusher)(nil)
 )

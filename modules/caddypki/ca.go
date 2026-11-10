@@ -18,17 +18,20 @@ import (
 	"crypto"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path"
 	"sync"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/truststore"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 // CA describes a certificate authority, which consists of
@@ -46,6 +49,9 @@ type CA struct {
 	// intermediate certificates.
 	IntermediateCommonName string `json:"intermediate_common_name,omitempty"`
 
+	// The lifetime for the intermediate certificates
+	IntermediateLifetime caddy.Duration `json:"intermediate_lifetime,omitempty"`
+
 	// Whether Caddy will attempt to install the CA's root
 	// into the system trust store, as well as into Java
 	// and Mozilla Firefox trust stores. Default: true.
@@ -56,6 +62,15 @@ type CA struct {
 
 	// The intermediate (signing) certificate; if null, one will be generated.
 	Intermediate *KeyPair `json:"intermediate,omitempty"`
+
+	// How often to check if intermediate (and root, when applicable) certificates need renewal.
+	// Default: 10m.
+	MaintenanceInterval caddy.Duration `json:"maintenance_interval,omitempty"`
+
+	// The fraction of certificate lifetime (0.0–1.0) after which renewal is attempted.
+	// For example, 0.2 means renew when 20% of the lifetime remains (e.g. ~73 days for a 1-year cert).
+	// Default: 0.2.
+	RenewalWindowRatio float64 `json:"renewal_window_ratio,omitempty"`
 
 	// Optionally configure a separate storage module associated with this
 	// issuer, instead of using Caddy's global/default-configured storage.
@@ -69,19 +84,22 @@ type CA struct {
 	// and module provisioning.
 	ID string `json:"-"`
 
-	storage     certmagic.Storage
-	root, inter *x509.Certificate
-	interKey    interface{} // TODO: should we just store these as crypto.Signer?
-	mu          *sync.RWMutex
+	storage    certmagic.Storage
+	root       *x509.Certificate
+	interChain []*x509.Certificate
+	interKey   crypto.Signer
+	mu         *sync.RWMutex
 
 	rootCertPath string // mainly used for logging purposes if trusting
 	log          *zap.Logger
+	ctx          caddy.Context
 }
 
 // Provision sets up the CA.
 func (ca *CA) Provision(ctx caddy.Context, id string, log *zap.Logger) error {
 	ca.mu = new(sync.RWMutex)
 	ca.log = log.Named("ca." + id)
+	ca.ctx = ctx
 
 	if id == "" {
 		return fmt.Errorf("CA ID is required (use 'local' for the default CA)")
@@ -114,16 +132,30 @@ func (ca *CA) Provision(ctx caddy.Context, id string, log *zap.Logger) error {
 	if ca.IntermediateCommonName == "" {
 		ca.IntermediateCommonName = defaultIntermediateCommonName
 	}
+	if ca.IntermediateLifetime == 0 {
+		ca.IntermediateLifetime = caddy.Duration(defaultIntermediateLifetime)
+	}
+	if ca.MaintenanceInterval == 0 {
+		ca.MaintenanceInterval = caddy.Duration(defaultMaintenanceInterval)
+	}
+	if ca.RenewalWindowRatio <= 0 || ca.RenewalWindowRatio > 1 {
+		ca.RenewalWindowRatio = defaultRenewalWindowRatio
+	}
 
 	// load the certs and key that will be used for signing
-	var rootCert, interCert *x509.Certificate
-	var rootKey, interKey interface{}
+	var rootCert *x509.Certificate
+	var rootCertChain, interCertChain []*x509.Certificate
+	var rootKey, interKey crypto.Signer
 	var err error
 	if ca.Root != nil {
 		if ca.Root.Format == "" || ca.Root.Format == "pem_file" {
 			ca.rootCertPath = ca.Root.Certificate
 		}
-		rootCert, rootKey, err = ca.Root.Load()
+		rootCertChain, rootKey, err = ca.Root.Load()
+		if err != nil {
+			return err
+		}
+		rootCert = rootCertChain[0]
 	} else {
 		ca.rootCertPath = "storage:" + ca.storageKeyRootCert()
 		rootCert, rootKey, err = ca.loadOrGenRoot()
@@ -131,17 +163,23 @@ func (ca *CA) Provision(ctx caddy.Context, id string, log *zap.Logger) error {
 	if err != nil {
 		return err
 	}
+
 	if ca.Intermediate != nil {
-		interCert, interKey, err = ca.Intermediate.Load()
+		interCertChain, interKey, err = ca.Intermediate.Load()
 	} else {
-		interCert, interKey, err = ca.loadOrGenIntermediate(rootCert, rootKey)
+		actualRootLifetime := time.Until(rootCert.NotAfter)
+		if time.Duration(ca.IntermediateLifetime) >= actualRootLifetime {
+			return fmt.Errorf("intermediate certificate lifetime must be less than actual root certificate lifetime (%s)", actualRootLifetime)
+		}
+
+		interCertChain, interKey, err = ca.loadOrGenIntermediate(rootCert, rootKey)
 	}
 	if err != nil {
 		return err
 	}
 
 	ca.mu.Lock()
-	ca.root, ca.inter, ca.interKey = rootCert, interCert, interKey
+	ca.root, ca.interChain, ca.interKey = rootCert, interCertChain, interKey
 	ca.mu.Unlock()
 
 	return nil
@@ -157,51 +195,73 @@ func (ca CA) RootCertificate() *x509.Certificate {
 // RootKey returns the CA's root private key. Since the root key is
 // not cached in memory long-term, it needs to be loaded from storage,
 // which could yield an error.
-func (ca CA) RootKey() (interface{}, error) {
+func (ca CA) RootKey() (crypto.Signer, error) {
 	_, rootKey, err := ca.loadOrGenRoot()
 	return rootKey, err
 }
 
-// IntermediateCertificate returns the CA's intermediate
-// certificate (public key).
-func (ca CA) IntermediateCertificate() *x509.Certificate {
+// IntermediateCertificateChain returns the CA's intermediate
+// certificate chain.
+func (ca CA) IntermediateCertificateChain() []*x509.Certificate {
 	ca.mu.RLock()
 	defer ca.mu.RUnlock()
-	return ca.inter
+	return ca.interChain
 }
 
 // IntermediateKey returns the CA's intermediate private key.
-func (ca CA) IntermediateKey() interface{} {
+func (ca CA) IntermediateKey() crypto.Signer {
 	ca.mu.RLock()
 	defer ca.mu.RUnlock()
 	return ca.interKey
 }
 
 // NewAuthority returns a new Smallstep-powered signing authority for this CA.
-func (ca CA) NewAuthority(authorityConfig AuthorityConfig) (*authority.Authority, error) {
+// Note that we receive *CA (a pointer) in this method to ensure the closure within it, which
+// executes at a later time, always has the only copy of the CA so it can access the latest,
+// renewed certificates since NewAuthority was called. See #4517 and #4669.
+func (ca *CA) NewAuthority(authorityConfig AuthorityConfig) (*authority.Authority, error) {
 	// get the root certificate and the issuer cert+key
 	rootCert := ca.RootCertificate()
-	var issuerCert *x509.Certificate
-	var issuerKey interface{}
+
+	// set up the signer; cert/key which signs the leaf certs
+	var signerOption authority.Option
 	if authorityConfig.SignWithRoot {
+		// if we're signing with root, we can just pass the
+		// cert/key directly, since it's unlikely to expire
+		// while Caddy is running (long lifetime)
+		var issuerCert *x509.Certificate
+		var issuerKey crypto.Signer
 		issuerCert = rootCert
 		var err error
 		issuerKey, err = ca.RootKey()
 		if err != nil {
 			return nil, fmt.Errorf("loading signing key: %v", err)
 		}
+		signerOption = authority.WithX509Signer(issuerCert, issuerKey)
 	} else {
-		issuerCert = ca.IntermediateCertificate()
-		issuerKey = ca.IntermediateKey()
+		// if we're signing with intermediate, we need to make
+		// sure it's always fresh, because the intermediate may
+		// renew while Caddy is running (medium lifetime)
+		signerOption = authority.WithX509SignerFunc(func() ([]*x509.Certificate, crypto.Signer, error) {
+			issuerChain := ca.IntermediateCertificateChain()
+			issuerCert := issuerChain[0]
+			issuerKey := ca.IntermediateKey()
+			ca.log.Debug("using intermediate signer",
+				zap.String("serial", issuerCert.SerialNumber.String()),
+				zap.String("not_before", issuerCert.NotBefore.String()),
+				zap.String("not_after", issuerCert.NotAfter.String()))
+			return issuerChain, issuerKey, nil
+		})
 	}
 
 	opts := []authority.Option{
 		authority.WithConfig(&authority.Config{
 			AuthorityConfig: authorityConfig.AuthConfig,
 		}),
-		authority.WithX509Signer(issuerCert, issuerKey.(crypto.Signer)),
+		signerOption,
 		authority.WithX509RootCerts(rootCert),
 	}
+
 	// Add a database if we have one
 	if authorityConfig.DB != nil {
 		opts = append(opts, authority.WithDatabase(*authorityConfig.DB))
@@ -214,10 +274,17 @@ func (ca CA) NewAuthority(authorityConfig AuthorityConfig) (*authority.Authority
 	return auth, nil
 }
 
-func (ca CA) loadOrGenRoot() (rootCert *x509.Certificate, rootKey interface{}, err error) {
-	rootCertPEM, err := ca.storage.Load(ca.storageKeyRootCert())
+func (ca CA) loadOrGenRoot() (rootCert *x509.Certificate, rootKey crypto.Signer, err error) {
+	if ca.Root != nil {
+		rootChain, rootSigner, err := ca.Root.Load()
+		if err != nil {
+			return nil, nil, err
+		}
+		return rootChain[0], rootSigner, nil
+	}
+	rootCertPEM, err := ca.storage.Load(ca.ctx, ca.storageKeyRootCert())
 	if err != nil {
-		if _, ok := err.(certmagic.ErrNotExist); !ok {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, nil, fmt.Errorf("loading root cert: %v", err)
 		}
 
@@ -229,13 +296,13 @@ func (ca CA) loadOrGenRoot() (rootCert *x509.Certificate, rootKey interface{}, e
 	}
 
 	if rootCert == nil {
-		rootCert, err = pemDecodeSingleCert(rootCertPEM)
+		rootCert, err = pemDecodeCertificate(rootCertPEM)
 		if err != nil {
 			return nil, nil, fmt.Errorf("parsing root certificate PEM: %v", err)
 		}
 	}
 	if rootKey == nil {
-		rootKeyPEM, err := ca.storage.Load(ca.storageKeyRootKey())
+		rootKeyPEM, err := ca.storage.Load(ca.ctx, ca.storageKeyRootKey())
 		if err != nil {
 			return nil, nil, fmt.Errorf("loading root key: %v", err)
 		}
@@ -248,7 +315,7 @@ func (ca CA) loadOrGenRoot() (rootCert *x509.Certificate, rootKey interface{}, e
 	return rootCert, rootKey, nil
 }
 
-func (ca CA) genRoot() (rootCert *x509.Certificate, rootKey interface{}, err error) {
+func (ca CA) genRoot() (rootCert *x509.Certificate, rootKey crypto.Signer, err error) {
 	repl := ca.newReplacer()
 
 	rootCert, rootKey, err = generateRoot(repl.ReplaceAll(ca.RootCommonName, ""))
@@ -259,7 +326,7 @@ func (ca CA) genRoot() (rootCert *x509.Certificate, rootKey interface{}, err err
 	if err != nil {
 		return nil, nil, fmt.Errorf("encoding root certificate: %v", err)
 	}
-	err = ca.storage.Store(ca.storageKeyRootCert(), rootCertPEM)
+	err = ca.storage.Store(ca.ctx, ca.storageKeyRootCert(), rootCertPEM)
 	if err != nil {
 		return nil, nil, fmt.Errorf("saving root certificate: %v", err)
 	}
@@ -267,7 +334,7 @@ func (ca CA) genRoot() (rootCert *x509.Certificate, rootKey interface{}, err err
 	if err != nil {
 		return nil, nil, fmt.Errorf("encoding root key: %v", err)
 	}
-	err = ca.storage.Store(ca.storageKeyRootKey(), rootKeyPEM)
+	err = ca.storage.Store(ca.ctx, ca.storageKeyRootKey(), rootKeyPEM)
 	if err != nil {
 		return nil, nil, fmt.Errorf("saving root key: %v", err)
 	}
@@ -275,10 +342,11 @@ func (ca CA) genRoot() (rootCert *x509.Certificate, rootKey interface{}, err err
 	return rootCert, rootKey, nil
 }
 
-func (ca CA) loadOrGenIntermediate(rootCert *x509.Certificate, rootKey crypto.PrivateKey) (interCert *x509.Certificate, interKey crypto.PrivateKey, err error) {
-	interCertPEM, err := ca.storage.Load(ca.storageKeyIntermediateCert())
+func (ca CA) loadOrGenIntermediate(rootCert *x509.Certificate, rootKey crypto.Signer) (interCertChain []*x509.Certificate, interKey crypto.Signer, err error) {
+	var interCert *x509.Certificate
+	interCertPEM, err := ca.storage.Load(ca.ctx, ca.storageKeyIntermediateCert())
 	if err != nil {
-		if _, ok := err.(certmagic.ErrNotExist); !ok {
+		if !errors.Is(err, fs.ErrNotExist) {
 			return nil, nil, fmt.Errorf("loading intermediate cert: %v", err)
 		}
 
@@ -287,17 +355,19 @@ func (ca CA) loadOrGenIntermediate(rootCert *x509.Certificate, rootKey crypto.Pr
 		if err != nil {
 			return nil, nil, fmt.Errorf("generating new intermediate cert: %v", err)
 		}
+
+		interCertChain = append(interCertChain, interCert)
 	}
 
-	if interCert == nil {
-		interCert, err = pemDecodeSingleCert(interCertPEM)
+	if len(interCertChain) == 0 {
+		interCertChain, err = pemDecodeCertificateChain(interCertPEM)
 		if err != nil {
 			return nil, nil, fmt.Errorf("decoding intermediate certificate PEM: %v", err)
 		}
 	}
 
 	if interKey == nil {
-		interKeyPEM, err := ca.storage.Load(ca.storageKeyIntermediateKey())
+		interKeyPEM, err := ca.storage.Load(ca.ctx, ca.storageKeyIntermediateKey())
 		if err != nil {
 			return nil, nil, fmt.Errorf("loading intermediate key: %v", err)
 		}
@@ -307,13 +377,13 @@ func (ca CA) loadOrGenIntermediate(rootCert *x509.Certificate, rootKey crypto.Pr
 		}
 	}
 
-	return interCert, interKey, nil
+	return interCertChain, interKey, nil
 }
 
-func (ca CA) genIntermediate(rootCert *x509.Certificate, rootKey crypto.PrivateKey) (interCert *x509.Certificate, interKey crypto.PrivateKey, err error) {
+func (ca CA) genIntermediate(rootCert *x509.Certificate, rootKey crypto.Signer) (interCert *x509.Certificate, interKey crypto.Signer, err error) {
 	repl := ca.newReplacer()
 
-	interCert, interKey, err = generateIntermediate(repl.ReplaceAll(ca.IntermediateCommonName, ""), rootCert, rootKey)
+	interCert, interKey, err = generateIntermediate(repl.ReplaceAll(ca.IntermediateCommonName, ""), rootCert, rootKey, time.Duration(ca.IntermediateLifetime))
 	if err != nil {
 		return nil, nil, fmt.Errorf("generating CA intermediate: %v", err)
 	}
@@ -321,7 +391,7 @@ func (ca CA) genIntermediate(rootCert *x509.Certificate, rootKey crypto.PrivateK
 	if err != nil {
 		return nil, nil, fmt.Errorf("encoding intermediate certificate: %v", err)
 	}
-	err = ca.storage.Store(ca.storageKeyIntermediateCert(), interCertPEM)
+	err = ca.storage.Store(ca.ctx, ca.storageKeyIntermediateCert(), interCertPEM)
 	if err != nil {
 		return nil, nil, fmt.Errorf("saving intermediate certificate: %v", err)
 	}
@@ -329,7 +399,7 @@ func (ca CA) genIntermediate(rootCert *x509.Certificate, rootKey crypto.PrivateK
 	if err != nil {
 		return nil, nil, fmt.Errorf("encoding intermediate key: %v", err)
 	}
-	err = ca.storage.Store(ca.storageKeyIntermediateKey(), interKeyPEM)
+	err = ca.storage.Store(ca.ctx, ca.storageKeyIntermediateKey(), interKeyPEM)
 	if err != nil {
 		return nil, nil, fmt.Errorf("saving intermediate key: %v", err)
 	}
@@ -340,15 +410,19 @@ func (ca CA) genIntermediate(rootCert *x509.Certificate, rootKey crypto.PrivateK
 func (ca CA) storageKeyCAPrefix() string {
 	return path.Join("pki", "authorities", certmagic.StorageKeys.Safe(ca.ID))
 }
+
 func (ca CA) storageKeyRootCert() string {
 	return path.Join(ca.storageKeyCAPrefix(), "root.crt")
 }
+
 func (ca CA) storageKeyRootKey() string {
 	return path.Join(ca.storageKeyCAPrefix(), "root.key")
 }
+
 func (ca CA) storageKeyIntermediateCert() string {
 	return path.Join(ca.storageKeyCAPrefix(), "intermediate.crt")
 }
+
 func (ca CA) storageKeyIntermediateKey() string {
 	return path.Join(ca.storageKeyCAPrefix(), "intermediate.key")
 }
@@ -400,4 +474,6 @@ const (
 
 	defaultRootLifetime         = 24 * time.Hour * 30 * 12 * 10
 	defaultIntermediateLifetime = 24 * time.Hour * 7
+	defaultMaintenanceInterval  = 10 * time.Minute
+	defaultRenewalWindowRatio   = 0.2
 )

@@ -21,35 +21,18 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 // ResponseWriterWrapper wraps an underlying ResponseWriter and
-// promotes its Pusher/Flusher/Hijacker methods as well. To use
-// this type, embed a pointer to it within your own struct type
-// that implements the http.ResponseWriter interface, then call
-// methods on the embedded value. You can make sure your type
-// wraps correctly by asserting that it implements the
-// HTTPInterfaces interface.
+// promotes its Pusher method as well. To use this type, embed
+// a pointer to it within your own struct type that implements
+// the http.ResponseWriter interface, then call methods on the
+// embedded value.
 type ResponseWriterWrapper struct {
 	http.ResponseWriter
-}
-
-// Hijack implements http.Hijacker. It simply calls the underlying
-// ResponseWriter's Hijack method if there is one, or returns
-// ErrNotImplemented otherwise.
-func (rww *ResponseWriterWrapper) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := rww.ResponseWriter.(http.Hijacker); ok {
-		return hj.Hijack()
-	}
-	return nil, nil, ErrNotImplemented
-}
-
-// Flush implements http.Flusher. It simply calls the underlying
-// ResponseWriter's Flush method if there is one.
-func (rww *ResponseWriterWrapper) Flush() {
-	if f, ok := rww.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
 }
 
 // Push implements http.Pusher. It simply calls the underlying
@@ -62,12 +45,87 @@ func (rww *ResponseWriterWrapper) Push(target string, opts *http.PushOptions) er
 	return ErrNotImplemented
 }
 
-// HTTPInterfaces mix all the interfaces that middleware ResponseWriters need to support.
-type HTTPInterfaces interface {
-	http.ResponseWriter
-	http.Pusher
-	http.Flusher
-	http.Hijacker
+// ReadFrom implements io.ReaderFrom. It retries to use io.ReaderFrom if available,
+// then fallback to io.Copy.
+// see: https://github.com/caddyserver/caddy/issues/6546
+func (rww *ResponseWriterWrapper) ReadFrom(r io.Reader) (n int64, err error) {
+	if rf, ok := rww.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(rww.ResponseWriter, r)
+}
+
+// Unwrap returns the underlying ResponseWriter, necessary for
+// http.ResponseController to work correctly.
+func (rww *ResponseWriterWrapper) Unwrap() http.ResponseWriter {
+	return rww.ResponseWriter
+}
+
+// UnwrapResponseWriterAs walks w through its Unwrap() http.ResponseWriter
+// chain and returns the first writer that satisfies T (along with true).
+// If no writer in the chain satisfies T, it returns the zero value of T
+// and false. This mirrors how http.ResponseController traverses wrapped
+// writers internally and is useful when code needs to reach interfaces
+// implemented only by the raw writer owned by the HTTP server — for
+// example, Extended CONNECT or WebTransport helpers that perform their
+// own type assertions and cannot see past a wrapper.
+func UnwrapResponseWriterAs[T any](w http.ResponseWriter) (T, bool) {
+	var zero T
+	seen := make(map[uintptr]struct{})
+	// Bound the walk so a cycle of uncomparable (non-pointer) writers
+	// cannot hang. Production wrapper stacks are a handful of layers.
+	for range 64 {
+		if w == nil {
+			return zero, false
+		}
+		if t, ok := any(w).(T); ok {
+			return t, true
+		}
+		if p := responseWriterPointer(w); p != 0 {
+			if _, dup := seen[p]; dup {
+				return zero, false
+			}
+			seen[p] = struct{}{}
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return zero, false
+		}
+		w = u.Unwrap()
+	}
+	return zero, false
+}
+
+func responseWriterPointer(w http.ResponseWriter) uintptr {
+	v := reflect.ValueOf(w)
+	// Only pointer-like kinds have stable identity.
+	//exhaustive:ignore
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.Slice, reflect.UnsafePointer:
+		if v.IsNil() {
+			return 0
+		}
+		return v.Pointer()
+	default:
+		return 0
+	}
+}
+
+// RecordHijackedStatus records that a status was already flushed to the
+// client by a writer further down the unwrap chain (for example
+// webtransport.Server.Upgrade writing through the naked HTTP/3 writer).
+// It updates any wrapping responseRecorder so access logs and metrics
+// observe the client-visible status, without writing headers again.
+func RecordHijackedStatus(w http.ResponseWriter, status int) {
+	rec, ok := UnwrapResponseWriterAs[*responseRecorder](w)
+	if !ok || rec == nil {
+		return
+	}
+	if rec.statusCode == 0 {
+		rec.statusCode = status
+	}
+	rec.wroteHeader = true
+	rec.stream = true
 }
 
 // ErrNotImplemented is returned when an underlying
@@ -82,6 +140,10 @@ type responseRecorder struct {
 	size         int
 	wroteHeader  bool
 	stream       bool
+	hijacked     bool
+	detached     bool
+
+	readSize *int
 }
 
 // NewResponseRecorder returns a new ResponseRecorder that can be
@@ -111,15 +173,15 @@ type responseRecorder struct {
 //
 // Proper usage of a recorder looks like this:
 //
-//     rec := caddyhttp.NewResponseRecorder(w, buf, shouldBuffer)
-//     err := next.ServeHTTP(rec, req)
-//     if err != nil {
-//         return err
-//     }
-//     if !rec.Buffered() {
-//         return nil
-//     }
-//     // process the buffered response here
+//	rec := caddyhttp.NewResponseRecorder(w, buf, shouldBuffer)
+//	err := next.ServeHTTP(rec, req)
+//	if err != nil {
+//	    return err
+//	}
+//	if !rec.Buffered() {
+//	    return nil
+//	}
+//	// process the buffered response here
 //
 // The header map is not buffered; i.e. the ResponseRecorder's Header()
 // method returns the same header map of the underlying ResponseWriter.
@@ -129,7 +191,7 @@ type responseRecorder struct {
 // Once you are ready to write the response, there are two ways you can
 // do it. The easier way is to have the recorder do it:
 //
-//     rec.WriteResponse()
+//	rec.WriteResponse()
 //
 // This writes the recorded response headers as well as the buffered body.
 // Or, you may wish to do it yourself, especially if you manipulated the
@@ -138,9 +200,12 @@ type responseRecorder struct {
 // recorder's body buffer, but you might have your own body to write
 // instead):
 //
-//     w.WriteHeader(rec.Status())
-//     io.Copy(w, rec.Buffer())
+//	w.WriteHeader(rec.Status())
+//	io.Copy(w, rec.Buffer())
 //
+// As a special case, 1xx responses are not buffered nor recorded
+// because they are not the final response; they are passed through
+// directly to the underlying ResponseWriter.
 func NewResponseRecorder(w http.ResponseWriter, buf *bytes.Buffer, shouldBuffer ShouldBufferFunc) ResponseRecorder {
 	return &responseRecorder{
 		ResponseWriterWrapper: &ResponseWriterWrapper{ResponseWriter: w},
@@ -149,12 +214,18 @@ func NewResponseRecorder(w http.ResponseWriter, buf *bytes.Buffer, shouldBuffer 
 	}
 }
 
+// WriteHeader writes the headers with statusCode to the wrapped
+// ResponseWriter unless the response is to be buffered instead.
+// 1xx responses are never buffered, except 101 which is treated
+// as a final upgrade response.
 func (rr *responseRecorder) WriteHeader(statusCode int) {
 	if rr.wroteHeader {
 		return
 	}
+
+	// save statusCode always, in case HTTP middleware upgrades websocket
+	// connections by manually setting headers and writing status 101
 	rr.statusCode = statusCode
-	rr.wroteHeader = true
 
 	// decide whether we should buffer the response
 	if rr.shouldBuffer == nil {
@@ -163,9 +234,14 @@ func (rr *responseRecorder) WriteHeader(statusCode int) {
 		rr.stream = !rr.shouldBuffer(rr.statusCode, rr.ResponseWriterWrapper.Header())
 	}
 
-	// if not buffered, immediately write header
-	if rr.stream {
-		rr.ResponseWriterWrapper.WriteHeader(rr.statusCode)
+	// 1xx responses except 101 aren't final; just informational
+	if statusCode < 100 || statusCode > 199 || statusCode == http.StatusSwitchingProtocols {
+		rr.wroteHeader = true
+	}
+
+	// if 1xx or not buffered, immediately write header
+	if rr.stream || (100 <= statusCode && statusCode <= 199) {
+		rr.ResponseWriterWrapper.WriteHeader(statusCode)
 	}
 }
 
@@ -178,9 +254,22 @@ func (rr *responseRecorder) Write(data []byte) (int, error) {
 	} else {
 		n, err = rr.buf.Write(data)
 	}
-	if err == nil {
-		rr.size += n
+
+	rr.size += n
+	return n, err
+}
+
+func (rr *responseRecorder) ReadFrom(r io.Reader) (int64, error) {
+	rr.WriteHeader(http.StatusOK)
+	var n int64
+	var err error
+	if rr.stream {
+		n, err = rr.ResponseWriterWrapper.ReadFrom(r)
+	} else {
+		n, err = rr.buf.ReadFrom(r)
 	}
+
+	rr.size += int(n)
 	return n, err
 }
 
@@ -206,28 +295,177 @@ func (rr *responseRecorder) Buffered() bool {
 	return !rr.stream
 }
 
+func (rr *responseRecorder) DetachAfterHijack(detached bool) bool {
+	if rr.hijacked {
+		return false
+	}
+	rr.detached = detached
+	return true
+}
+
 func (rr *responseRecorder) WriteResponse() error {
-	if rr.stream {
+	if rr.hijacked {
 		return nil
 	}
 	if rr.statusCode == 0 {
 		// could happen if no handlers actually wrote anything,
 		// and this prevents a panic; status must be > 0
-		rr.statusCode = http.StatusOK
+		rr.WriteHeader(http.StatusOK)
+	}
+	if rr.stream {
+		return nil
 	}
 	rr.ResponseWriterWrapper.WriteHeader(rr.statusCode)
 	_, err := io.Copy(rr.ResponseWriterWrapper, rr.buf)
 	return err
 }
 
+// FlushError will suppress actual flushing if the response is buffered. See:
+// https://github.com/caddyserver/caddy/issues/6144
+func (rr *responseRecorder) FlushError() error {
+	if rr.stream {
+		//nolint:bodyclose
+		return http.NewResponseController(rr.ResponseWriterWrapper).Flush()
+	}
+	return nil
+}
+
+// Private interface so it can only be used in this package
+// #TODO: maybe export it later
+func (rr *responseRecorder) setReadSize(size *int) {
+	rr.readSize = size
+}
+
+func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if !rr.wroteHeader {
+		// hijacking without writing status code first works as long as
+		// subsequent writes follows http1.1 wire format, but it will
+		// show up with a status code of 0 in the access log and bytes
+		// written will include response headers. Response headers won't
+		// be present in the log if not set on the response writer.
+		caddy.Log().Warn("hijacking without writing status code first")
+	}
+	//nolint:bodyclose
+	conn, brw, err := http.NewResponseController(rr.ResponseWriterWrapper).Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	rr.hijacked = true
+	rr.stream = true
+	rr.wroteHeader = true
+	if rr.detached {
+		return conn, brw, nil
+	}
+	// Per http documentation, returned bufio.Writer is empty, but bufio.Read maybe not
+	conn = &hijackedConn{conn, rr}
+	brw.Writer.Reset(conn)
+
+	buffered := brw.Reader.Buffered()
+	if buffered != 0 {
+		conn.(*hijackedConn).updateReadSize(buffered)
+		data, _ := brw.Peek(buffered)
+		brw.Reader.Reset(io.MultiReader(bytes.NewReader(data), conn))
+		// peek to make buffered data appear, as Reset will make it 0
+		_, _ = brw.Peek(buffered)
+	} else {
+		brw.Reader.Reset(conn)
+	}
+	return conn, brw, nil
+}
+
+// used to track the size of hijacked response writers
+type hijackedConn struct {
+	net.Conn
+	rr *responseRecorder
+}
+
+func (hc *hijackedConn) updateReadSize(n int) {
+	if hc.rr.readSize != nil {
+		*hc.rr.readSize += n
+	}
+}
+
+func (hc *hijackedConn) Read(p []byte) (int, error) {
+	n, err := hc.Conn.Read(p)
+	hc.updateReadSize(n)
+	return n, err
+}
+
+func (hc *hijackedConn) WriteTo(w io.Writer) (int64, error) {
+	n, err := io.Copy(w, hc.Conn)
+	hc.updateReadSize(int(n))
+	return n, err
+}
+
+func (hc *hijackedConn) Write(p []byte) (int, error) {
+	n, err := hc.Conn.Write(p)
+	hc.rr.size += n
+	return n, err
+}
+
+func (hc *hijackedConn) ReadFrom(r io.Reader) (int64, error) {
+	n, err := io.Copy(hc.Conn, r)
+	hc.rr.size += int(n)
+	return n, err
+}
+
+// DetachResponseWriterAfterHijack configures w and its wrapped response
+// writers to detach when hijacked. It succeeds only if every detaching writer
+// accepts and the unwrap chain reaches the server-owned writer recorded on r.
+// When detached, bytes read or written stats will not be recorded for the
+// hijacked connection, and it's safe to use the connection after HTTP
+// middleware returns.
+func DetachResponseWriterAfterHijack(w http.ResponseWriter, r *http.Request, detached bool) bool {
+	if r == nil {
+		return false
+	}
+	boundaryWriter, _ := r.Context().Value(responseWriterBoundaryCtxKey).(http.ResponseWriter)
+	boundary := responseWriterPointer(boundaryWriter)
+	if boundary == 0 {
+		return false
+	}
+	seen := make(map[uintptr]struct{})
+	for range 64 {
+		if w == nil {
+			return false
+		}
+		pointer := responseWriterPointer(w)
+		if pointer != 0 {
+			if _, duplicate := seen[pointer]; duplicate {
+				return false
+			}
+			seen[pointer] = struct{}{}
+		}
+		if detacher, ok := w.(interface{ DetachAfterHijack(bool) bool }); ok {
+			if !detacher.DetachAfterHijack(detached) {
+				return false
+			}
+		}
+		if pointer == boundary {
+			return true
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return false
+		}
+		w = unwrapper.Unwrap()
+	}
+	return false
+}
+
+type responseWriterBoundaryCtxKeyType struct{}
+
+var responseWriterBoundaryCtxKey = responseWriterBoundaryCtxKeyType{}
+
 // ResponseRecorder is a http.ResponseWriter that records
 // responses instead of writing them to the client. See
 // docs for NewResponseRecorder for proper usage.
 type ResponseRecorder interface {
-	HTTPInterfaces
+	http.ResponseWriter
 	Status() int
 	Buffer() *bytes.Buffer
 	Buffered() bool
+	DetachAfterHijack(bool) bool
 	Size() int
 	WriteResponse() error
 }
@@ -239,6 +477,15 @@ type ShouldBufferFunc func(status int, header http.Header) bool
 
 // Interface guards
 var (
-	_ HTTPInterfaces   = (*ResponseWriterWrapper)(nil)
-	_ ResponseRecorder = (*responseRecorder)(nil)
+	_ http.ResponseWriter = (*ResponseWriterWrapper)(nil)
+	_ ResponseRecorder    = (*responseRecorder)(nil)
+
+	// Implementing ReaderFrom can be such a significant
+	// optimization that it should probably be required!
+	// see PR #5022 (25%-50% speedup)
+	_ io.ReaderFrom = (*ResponseWriterWrapper)(nil)
+	_ io.ReaderFrom = (*responseRecorder)(nil)
+	_ io.ReaderFrom = (*hijackedConn)(nil)
+
+	_ io.WriterTo = (*hijackedConn)(nil)
 )

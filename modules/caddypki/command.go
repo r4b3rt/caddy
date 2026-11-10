@@ -18,21 +18,22 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
-	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"path"
 
-	"github.com/caddyserver/caddy/v2"
-	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 	"github.com/smallstep/truststore"
+	"github.com/spf13/cobra"
+
+	caddycmd "github.com/caddyserver/caddy/v2/cmd"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "trust",
-		Func:  cmdTrust,
 		Usage: "[--ca <id>] [--address <listen>] [--config <path> [--adapter <name>]]",
 		Short: "Installs a CA certificate into local trust stores",
 		Long: `
@@ -53,19 +54,17 @@ This command will attempt to connect to Caddy's admin API running at
 '` + caddy.DefaultAdminListen + `' to fetch the root certificate. You may
 explicitly specify the --address, or use the --config flag to load
 the admin address from your config, if not using the default.`,
-		Flags: func() *flag.FlagSet {
-			fs := flag.NewFlagSet("trust", flag.ExitOnError)
-			fs.String("ca", "", "The ID of the CA to trust (defaults to 'local')")
-			fs.String("address", "", "Address of the administration API listener (if --config is not used)")
-			fs.String("config", "", "Configuration file (if --address is not used)")
-			fs.String("adapter", "", "Name of config adapter to apply (if --config is used)")
-			return fs
-		}(),
+		CobraFunc: func(cmd *cobra.Command) {
+			cmd.Flags().StringP("ca", "", "", "The ID of the CA to trust (defaults to 'local')")
+			cmd.Flags().StringP("address", "", "", "Address of the administration API listener (if --config is not used)")
+			cmd.Flags().StringP("config", "c", "", "Configuration file (if --address is not used)")
+			cmd.Flags().StringP("adapter", "a", "", "Name of config adapter to apply (if --config is used)")
+			cmd.RunE = caddycmd.WrapCommandFuncForCobra(cmdTrust)
+		},
 	})
 
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "untrust",
-		Func:  cmdUntrust,
 		Usage: "[--cert <path>] | [[--ca <id>] [--address <listen>] [--config <path> [--adapter <name>]]]",
 		Short: "Untrusts a locally-trusted CA certificate",
 		Long: `
@@ -89,15 +88,14 @@ will attempt to connect to the Caddy's admin API running at
 '` + caddy.DefaultAdminListen + `' to fetch the root certificate.
 You may explicitly specify the --address, or use the --config flag
 to load the admin address from your config, if not using the default.`,
-		Flags: func() *flag.FlagSet {
-			fs := flag.NewFlagSet("untrust", flag.ExitOnError)
-			fs.String("cert", "", "The path to the CA certificate to untrust")
-			fs.String("ca", "", "The ID of the CA to untrust (defaults to 'local')")
-			fs.String("address", "", "Address of the administration API listener (if --config is not used)")
-			fs.String("config", "", "Configuration file (if --address is not used)")
-			fs.String("adapter", "", "Name of config adapter to apply (if --config is used)")
-			return fs
-		}(),
+		CobraFunc: func(cmd *cobra.Command) {
+			cmd.Flags().StringP("cert", "p", "", "The path to the CA certificate to untrust")
+			cmd.Flags().StringP("ca", "", "", "The ID of the CA to untrust (defaults to 'local')")
+			cmd.Flags().StringP("address", "", "", "Address of the administration API listener (if --config is not used)")
+			cmd.Flags().StringP("config", "c", "", "Configuration file (if --address is not used)")
+			cmd.Flags().StringP("adapter", "a", "", "Name of config adapter to apply (if --config is used)")
+			cmd.RunE = caddycmd.WrapCommandFuncForCobra(cmdUntrust)
+		},
 	})
 }
 
@@ -113,7 +111,7 @@ func cmdTrust(fl caddycmd.Flags) (int, error) {
 	}
 
 	// Determine where we're sending the request to get the CA info
-	adminAddr, err := caddycmd.DetermineAdminAPIAddress(addrFlag, configFlag, configAdapterFlag)
+	adminAddr, err := caddycmd.DetermineAdminAPIAddress(addrFlag, nil, configFlag, configAdapterFlag)
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("couldn't determine admin API address: %v", err)
 	}
@@ -133,7 +131,7 @@ func cmdTrust(fl caddycmd.Flags) (int, error) {
 	ca := CA{
 		log:          caddy.Log(),
 		root:         rootCert,
-		rootCertPath: adminAddr + path.Join(adminPKIEndpointBase, caID, "certificates"),
+		rootCertPath: adminAddr + path.Join(adminPKIEndpointBase, "ca", caID),
 	}
 
 	// Install the cert!
@@ -182,7 +180,7 @@ func cmdUntrust(fl caddycmd.Flags) (int, error) {
 	}
 
 	// Determine where we're sending the request to get the CA info
-	adminAddr, err := caddycmd.DetermineAdminAPIAddress(addrFlag, configFlag, configAdapterFlag)
+	adminAddr, err := caddycmd.DetermineAdminAPIAddress(addrFlag, nil, configFlag, configAdapterFlag)
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("couldn't determine admin API address: %v", err)
 	}
@@ -207,7 +205,7 @@ func cmdUntrust(fl caddycmd.Flags) (int, error) {
 
 // rootCertFromAdmin makes the API request to fetch the root certificate for the named CA via admin API.
 func rootCertFromAdmin(adminAddr string, caID string) (*x509.Certificate, error) {
-	uri := path.Join(adminPKIEndpointBase, caID, "certificates")
+	uri := path.Join(adminPKIEndpointBase, "ca", caID)
 
 	// Make the request to fetch the CA info
 	resp, err := caddycmd.AdminAPIRequest(adminAddr, http.MethodGet, uri, make(http.Header), nil)

@@ -15,8 +15,10 @@
 package requestbody
 
 import (
+	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -30,7 +32,13 @@ func init() {
 type RequestBody struct {
 	// The maximum number of bytes to allow reading from the body by a later handler.
 	// If more bytes are read, an error with HTTP status 413 is returned.
+	// Requests declaring a larger Content-Length get the same error
+	// before any later handler runs.
 	MaxSize int64 `json:"max_size,omitempty"`
+
+	// This field permit to replace body on the fly
+	// EXPERIMENTAL. Subject to change/removal.
+	Set string `json:"set,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -42,11 +50,30 @@ func (RequestBody) CaddyModule() caddy.ModuleInfo {
 }
 
 func (rb RequestBody) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if rb.Set != "" {
+		if r.Body != nil {
+			err := r.Body.Close()
+			if err != nil {
+				return err
+			}
+		}
+		repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		// Only known placeholders are replaced: the body is user-supplied and
+		// often JSON, whose braces would otherwise be read as placeholders and
+		// blanked, sending an empty body instead. This matches the respond body.
+		replacedBody := repl.ReplaceKnown(rb.Set, "")
+		r.Body = io.NopCloser(strings.NewReader(replacedBody))
+		r.ContentLength = int64(len(replacedBody))
+	}
 	if r.Body == nil {
 		return next.ServeHTTP(w, r)
 	}
 	if rb.MaxSize > 0 {
+		// wrap before rejecting: error routes get this request and may read the body
 		r.Body = errorWrapper{http.MaxBytesReader(w, r.Body, rb.MaxSize)}
+		if r.ContentLength > rb.MaxSize {
+			return caddyhttp.Error(http.StatusRequestEntityTooLarge, &http.MaxBytesError{Limit: rb.MaxSize})
+		}
 	}
 	return next.ServeHTTP(w, r)
 }
@@ -59,10 +86,10 @@ type errorWrapper struct {
 
 func (ew errorWrapper) Read(p []byte) (n int, err error) {
 	n, err = ew.ReadCloser.Read(p)
-	if err != nil && err.Error() == "http: request body too large" {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 		err = caddyhttp.Error(http.StatusRequestEntityTooLarge, err)
 	}
-	return
+	return n, err
 }
 
 // Interface guard

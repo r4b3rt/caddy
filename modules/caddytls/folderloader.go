@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"encoding/pem"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,18 @@ func (FolderLoader) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// Provision implements caddy.Provisioner.
+func (fl FolderLoader) Provision(ctx caddy.Context) error {
+	repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	if !ok {
+		repl = caddy.NewReplacer()
+	}
+	for k, path := range fl {
+		fl[k] = repl.ReplaceKnown(path, "")
+	}
+	return nil
+}
+
 // LoadCertificates loads all the certificates+keys in the directories
 // listed in fl from all files ending with .pem. This method of loading
 // certificates expects the certificate and key to be bundled into the
@@ -50,18 +63,27 @@ func (FolderLoader) CaddyModule() caddy.ModuleInfo {
 func (fl FolderLoader) LoadCertificates() ([]Certificate, error) {
 	var certs []Certificate
 	for _, dir := range fl {
-		err := filepath.Walk(dir, func(fpath string, info os.FileInfo, err error) error {
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return nil, fmt.Errorf("unable to open root directory %s: %w", dir, err)
+		}
+		err = filepath.WalkDir(dir, func(fpath string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return fmt.Errorf("unable to traverse into path: %s", fpath)
 			}
-			if info.IsDir() {
+			if d.IsDir() {
 				return nil
 			}
-			if !strings.HasSuffix(strings.ToLower(info.Name()), ".pem") {
+			if !strings.HasSuffix(strings.ToLower(d.Name()), ".pem") {
 				return nil
 			}
 
-			bundle, err := os.ReadFile(fpath)
+			rel, err := filepath.Rel(dir, fpath)
+			if err != nil {
+				return fmt.Errorf("unable to get relative path for %s: %w", fpath, err)
+			}
+
+			bundle, err := root.ReadFile(rel)
 			if err != nil {
 				return err
 			}
@@ -71,11 +93,11 @@ func (fl FolderLoader) LoadCertificates() ([]Certificate, error) {
 			}
 
 			certs = append(certs, Certificate{Certificate: cert})
-
 			return nil
 		})
+		_ = root.Close()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("walking certificates directory %s: %w", dir, err)
 		}
 	}
 	return certs, nil
@@ -138,6 +160,12 @@ func tlsCertFromCertAndKeyPEMBundle(bundle []byte) (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("no private key block found")
 	}
 
+	// if the start of the key file looks like an encrypted private key,
+	// reject it with a helpful error message
+	if strings.HasPrefix(string(keyPEMBytes[:40]), "ENCRYPTED") {
+		return tls.Certificate{}, fmt.Errorf("encrypted private keys are not supported; please decrypt the key first")
+	}
+
 	cert, err := tls.X509KeyPair(certPEMBytes, keyPEMBytes)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("making X509 key pair: %v", err)
@@ -146,4 +174,7 @@ func tlsCertFromCertAndKeyPEMBundle(bundle []byte) (tls.Certificate, error) {
 	return cert, nil
 }
 
-var _ CertificateLoader = (FolderLoader)(nil)
+var (
+	_ CertificateLoader = FolderLoader(nil)
+	_ caddy.Provisioner = FolderLoader(nil)
+)

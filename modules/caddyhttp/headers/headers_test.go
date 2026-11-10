@@ -82,6 +82,26 @@ func TestHandler(t *testing.T) {
 		{
 			handler: Handler{
 				Request: &HeaderOps{
+					Delete: []string{
+						"*-suffix",
+						"prefix-*",
+						"*_*",
+					},
+				},
+			},
+			reqHeader: http.Header{
+				"Header-Suffix": []string{"lalala"},
+				"Prefix-Test":   []string{"asdf"},
+				"Host_Header":   []string{"silly django... sigh"}, // see issue #4830
+				"Keep-Me":       []string{"foofoofoo"},
+			},
+			expectedReqHeader: http.Header{
+				"Keep-Me": []string{"foofoofoo"},
+			},
+		},
+		{
+			handler: Handler{
+				Request: &HeaderOps{
 					Replace: map[string][]Replacement{
 						"Best-Server": {
 							Replacement{
@@ -121,6 +141,28 @@ func TestHandler(t *testing.T) {
 			respHeader: http.Header{},
 			expectedRespHeader: http.Header{
 				"Cache-Control": []string{"no-cache"},
+			},
+		},
+		{ // same as above, but checks that response headers are left alone when "Require" conditions are unmet
+			handler: Handler{
+				Response: &RespHeaderOps{
+					Require: &caddyhttp.ResponseMatcher{
+						Headers: http.Header{
+							"Cache-Control": nil,
+						},
+					},
+					HeaderOps: &HeaderOps{
+						Add: http.Header{
+							"Cache-Control": []string{"no-cache"},
+						},
+					},
+				},
+			},
+			respHeader: http.Header{
+				"Cache-Control": []string{"something"},
+			},
+			expectedRespHeader: http.Header{
+				"Cache-Control": []string{"something"},
 			},
 		},
 		{
@@ -225,8 +267,170 @@ func TestHandler(t *testing.T) {
 	}
 }
 
+func TestHeaderOpsSetMultipleCookies(t *testing.T) {
+	want := []string{"a=1; Path=/", "b=2; Path=/"}
+	for _, tc := range []struct {
+		fieldName, provisionedName string
+	}{
+		{"Set-Cookie", "Set-Cookie"},
+		{"set-cookie", "Set-Cookie"},
+		{"sEt-CoOkIe", "Set-Cookie"},
+		{"{cookie_header}", "{cookie_header}"},
+		{"set-{cookie_suffix}", "set-{cookie_suffix}"},
+	} {
+		t.Run(tc.fieldName, func(t *testing.T) {
+			ops := HeaderOps{Set: http.Header{tc.fieldName: want}}
+			if err := ops.Provision(caddy.Context{}); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(ops.Set, http.Header{tc.provisionedName: want}) {
+				t.Fatalf("provisioned Set = %v, want field %q", ops.Set, tc.provisionedName)
+			}
+			repl := caddy.NewReplacer()
+			repl.Set("cookie_header", "set-cookie")
+			repl.Set("cookie_suffix", "cookie")
+			hdr := http.Header{"Set-Cookie": {"old=1"}}
+			ops.ApplyTo(hdr, repl)
+			if got := hdr.Values("Set-Cookie"); !reflect.DeepEqual(got, want) {
+				t.Errorf("Set-Cookie values = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestHandlerProvisionSetCollision(t *testing.T) {
+	for _, name := range []string{"request", "response"} {
+		t.Run(name, func(t *testing.T) {
+			ops := &HeaderOps{Set: http.Header{
+				"set-cookie": {"b=2; Path=/"},
+				"Set-Cookie": {"a=1; Path=/"},
+			}}
+			h := Handler{Request: ops}
+			if name == "response" {
+				h = Handler{Response: &RespHeaderOps{HeaderOps: ops}}
+			}
+			if err := h.Provision(caddy.Context{}); err != nil {
+				t.Fatal(err)
+			}
+			want := http.Header{"Set-Cookie": {"a=1; Path=/", "b=2; Path=/"}}
+			if !reflect.DeepEqual(ops.Set, want) {
+				t.Fatalf("provisioned Set = %v, want %v", ops.Set, want)
+			}
+			hdr := make(http.Header)
+			ops.ApplyTo(hdr, caddy.NewReplacer())
+			if !reflect.DeepEqual(hdr, want) {
+				t.Errorf("headers = %v, want %v", hdr, want)
+			}
+		})
+	}
+}
+
 type nextHandler func(http.ResponseWriter, *http.Request) error
 
 func (f nextHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	return f(w, r)
+}
+
+func TestContainsPlaceholders(t *testing.T) {
+	for i, tc := range []struct {
+		input    string
+		expected bool
+	}{
+		{"static", false},
+		{"{placeholder}", true},
+		{"prefix-{placeholder}-suffix", true},
+		{"{}", false},
+		{"no-braces", false},
+		{"{unclosed", false},
+		{"unopened}", false},
+	} {
+		actual := containsPlaceholders(tc.input)
+		if actual != tc.expected {
+			t.Errorf("Test %d: containsPlaceholders(%q) = %v, expected %v", i, tc.input, actual, tc.expected)
+		}
+	}
+}
+
+func TestHeaderProvisionSkipsPlaceholders(t *testing.T) {
+	ops := &HeaderOps{
+		Replace: map[string][]Replacement{
+			"Static": {
+				Replacement{SearchRegexp: ":443", Replace: "STATIC"},
+			},
+			"Dynamic": {
+				Replacement{SearchRegexp: ":{http.request.local.port}", Replace: "DYNAMIC"},
+			},
+		},
+	}
+
+	err := ops.Provision(caddy.Context{})
+	if err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	// Static regex should be precompiled
+	if ops.Replace["Static"][0].re == nil {
+		t.Error("Expected static regex to be precompiled")
+	}
+
+	// Dynamic regex with placeholder should not be precompiled
+	if ops.Replace["Dynamic"][0].re != nil {
+		t.Error("Expected dynamic regex with placeholder to not be precompiled")
+	}
+}
+
+func TestPlaceholderInSearchRegexp(t *testing.T) {
+	handler := Handler{
+		Response: &RespHeaderOps{
+			HeaderOps: &HeaderOps{
+				Replace: map[string][]Replacement{
+					"Test-Header": {
+						Replacement{
+							SearchRegexp: ":{http.request.local.port}",
+							Replace:      "PLACEHOLDER-WORKS",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Provision the handler
+	err := handler.Provision(caddy.Context{})
+	if err != nil {
+		t.Fatalf("Provision failed: %v", err)
+	}
+
+	replacement := handler.Response.HeaderOps.Replace["Test-Header"][0]
+	t.Logf("After provision - SearchRegexp: %q, re: %v", replacement.SearchRegexp, replacement.re)
+
+	rr := httptest.NewRecorder()
+
+	req := httptest.NewRequest("GET", "http://localhost:443/", nil)
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.local.port", "443")
+
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	rr.Header().Set("Test-Header", "prefix:443suffix")
+	t.Logf("Initial header: %v", rr.Header())
+
+	next := nextHandler(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(200)
+		return nil
+	})
+
+	err = handler.ServeHTTP(rr, req, next)
+	if err != nil {
+		t.Fatalf("ServeHTTP failed: %v", err)
+	}
+
+	t.Logf("Final header: %v", rr.Header())
+
+	result := rr.Header().Get("Test-Header")
+	expected := "prefixPLACEHOLDER-WORKSsuffix"
+	if result != expected {
+		t.Errorf("Expected header value %q, got %q", expected, result)
+	}
 }
